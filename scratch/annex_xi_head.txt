@@ -1,0 +1,61 @@
+﻿ANNEX XIII, point 4
+Cereal seed
+Directive 66/402/EEC
+Annex XIII, point 5
+Vegetable seed
+Directive 2002/55/EC
+ANNEX XIII, point 6
+Oil and fibre plants seed
+Directive 2002/57/EC
+ANNEX II
+List of Union quarantine pests and their respective codes
+TABLE OF CONTENTS
+Part A: Pests not known to occur in the Union territory
+A.
+Bacteria
+B.
+Fungi and oomycetes
+C.
+Insects and mites
+D.
+Nematodes
+E.
+Parasitic plants
+F.
+Viruses, viroids and phytoplasmas
+Part B: Pests known to occur in the Union territory
+A.
+Bacteria
+B.
+Fungi and oomycetes
+C.
+Insects and mites
+D.
+Molluscs
+E.
+Nematodes
+F.
+Viruses, viroids and phytoplasmas
+PART A
+PESTS NOT KNOWN TO OCCUR IN THE UNION TERRITORY
+Â 
+Quarantine Pests and their codes assigned by EPPO
+A. 
+Bacteria
+1.
+Candidatus
+ Liberibacter africanus [LIBEAF]
+2.
+Candidatus
+ Liberibacter americanus [LIBEAM]
+3.
+Candidatus
+ Liberibacter asiaticus [LIBEAS]
+4.
+Curtobacterium flaccumfaciens
+ pv. 
+flaccumfaciens
+ (Hedges) Collins and Jones [CORBFL]
+5.
+Pantoea stewartii
+ subsp. 
