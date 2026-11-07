@@ -44,7 +44,7 @@ The architecture, product catalog, regulatory model, and applicability engine mu
 ## Decision
 Adopt **Option 3 (Declarative Relational Multi-Sector Regulatory Model with Deterministic Rule Engine)**:
 
-### 1. Multi-Sector Entity Architecture
+### 1. Multi-Sector Entity Architecture & Deterministic Matching Specification
 ```mermaid
 graph TD
     A["regulatory_acts (Official Gazette Record)<br>sector: AGRI_FOOD | TEXTILES_APPAREL | CROSS_SECTOR"] --> B["regulatory_requirements (Atomic Obligation)<br>category: ENHANCED_CONTROLS | SAFETY_STANDARDS | REACH | MRL"]
@@ -53,6 +53,29 @@ graph TD
     D --> E["Evaluated against product profile"]
     B --> F["evidence_requirements (Expected Documents)"]
 ```
+
+#### Deterministic Sector Matching Specification:
+Sector separation is enforced through explicit query predicates in the application logic, NOT by database indexes alone (an index is an access optimization, not a security or partitioning constraint):
+
+1. **Mandatory Sector Predicate:**
+   When evaluating applicable requirements for product $P$ (with sector $P_{\text{sector}}$, HS code $P_{\text{hs}}$, origin $P_{\text{origin}}$, destination $P_{\text{dest}}$):
+   ```sql
+   SELECT ar.*, rr.*, ra.*
+   FROM applicability_rules ar
+   JOIN regulatory_requirements rr ON ar.requirement_id = rr.id
+   JOIN regulatory_acts ra ON rr.act_id = ra.id
+   WHERE (ar.sector = :product_sector OR ar.sector = 'CROSS_SECTOR')
+     AND :product_hs_code LIKE (ar.hs_code_prefix || '%')
+     AND ar.origin_country = :product_origin
+     AND ar.destination_market = :product_dest
+     AND ar.is_active = true;
+   ```
+2. **Cross-Sector Rules vs. Sector-Specific Rules:**
+   - **`CROSS_SECTOR`:** Applies to broad horizontal trade requirements (e.g., EUR.1 Movement Certificates under EU-Egypt Association Agreement, commercial invoice declarations, general customs formalities) where the rule applies to any commodity matching the HS prefix regardless of whether it is agricultural or industrial.
+   - **`AGRI_FOOD` / `TEXTILES_APPAREL`:** Strict sector partitioning. An agri-food rule (`sector = 'AGRI_FOOD'`) will NEVER match a garment product because the predicate `ar.sector = :product_sector` evaluates to false. Conversely, textile rules (`sector = 'TEXTILES_APPAREL'`) will never match citrus or fruit.
+3. **Implementation Status:**
+   - The relational data model and schema support are **VERIFIED** in Phase 1 (`apps/api/app/db/models.py`).
+   - The runtime evaluation engine and service layer are **NOT IMPLEMENTED in Phase 1** (scheduled for implementation in Phase 2). No Phase 2 code is introduced prematurely.
 
 ### 2. Legal Evidence Precision & Safeguards
 1. **Enhanced Official Controls vs. Pesticide MRLs:**

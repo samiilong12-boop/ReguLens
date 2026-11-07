@@ -533,24 +533,39 @@ CREATE POLICY rls_audit_logs_insert ON audit_logs
 
 ## 5. Database Roles & Permission Boundaries
 
-```sql
--- Application runtime role (least privilege)
-CREATE ROLE regulens_app WITH LOGIN NOBYPASSRLS;
+Database role provisioning is managed outside ordinary schema migrations using the dedicated executable script [`scripts/init_db_roles.sql`](file:///c:/Users/same/Desktop/REGULENS/scripts/init_db_roles.sql).
 
--- Grant DML permissions on tenant tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON 
-    tenants, tenant_users, products, consignments, documents, 
-    evidence_items, gap_analyses, gap_analysis_items, human_reviews, 
-    export_reports, background_jobs 
-TO regulens_app;
+### Ownership & Role Architecture:
+1. **Migration Owner Role (`regulens_migrator`):**
+   - Owns the database schema, all tables, and sequences.
+   - Executes Alembic migrations (`alembic upgrade head`).
+   - Does NOT run the application API server.
+2. **Runtime Application Role (`regulens_app`):**
+   - Unprivileged role used by the FastAPI backend connection pool (`DATABASE_URL`).
+   - Configured with `NOBYPASSRLS`, `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOINHERIT`.
+   - Cannot bypass Row Level Security under any circumstances.
+   - Has DML privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) on customer data tables.
+   - Has strictly append-only permissions on `audit_logs` (`SELECT`, `INSERT` only; `UPDATE`, `DELETE`, `TRUNCATE` revoked).
+   - Has read-only permissions on global regulatory reference tables (`SELECT` only).
 
--- Grant append-only and read permissions on audit_logs (NO UPDATE, NO DELETE)
-GRANT SELECT, INSERT ON audit_logs TO regulens_app;
-REVOKE UPDATE, DELETE ON audit_logs FROM regulens_app;
+### Controlled Provisioning & Tenant Table Authorization Design:
+- **`tenants` table:**
+  - `SELECT`: Allowed under RLS where `id = current_setting('app.current_tenant_id', true)::uuid`.
+  - `INSERT`: Controlled provisioning flow. No broad RLS `INSERT` policy exists; tenant creation is executed via trusted administrative provisioning service.
+  - `UPDATE`: Controlled administrative flow. To prevent arbitrary tenant users from modifying organizational tax IDs or commercial registration metadata, updates require server-side verification of `TENANT_ADMIN` role credentials.
+  - `DELETE`: Prohibited for standard runtime connections. Tenant offboarding requires formal data retention and compliance review.
+- **`background_jobs` table:**
+  - Fully isolated under RLS (`tenant_id = current_setting(...)`). Background workers bind the specific tenant context before job execution.
+- **`tenant_users` table:**
+  - Isolated under RLS by `tenant_id`, preventing cross-tenant membership leakage.
+- **`audit_logs` table:**
+  - Immutable at two independent layers: RLS (no UPDATE/DELETE policy) and SQL privileges (`REVOKE UPDATE, DELETE, TRUNCATE FROM regulens_app`).
 
--- Grant read-only permissions on global regulatory reference tables
-GRANT SELECT ON regulatory_acts, regulatory_requirements, citations, applicability_rules 
-TO regulens_app;
-REVOKE INSERT, UPDATE, DELETE ON regulatory_acts, regulatory_requirements, citations, applicability_rules 
-FROM regulens_app;
+### Setup Procedure:
+```powershell
+# 1. Execute role initialization as PostgreSQL superuser (e.g. postgres)
+psql -U postgres -d postgres -f scripts/init_db_roles.sql
+
+# 2. Run schema migrations as migration owner
+alembic upgrade head
 ```

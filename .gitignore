@@ -49,6 +49,7 @@ lerna-debug.log*
 .next/
 out/
 .turbo/
+*.tsbuildinfo
 
 # Databases & Local Storage
 *.sqlite3

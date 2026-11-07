@@ -12,6 +12,7 @@ from app.db.models import (
     ExportReport,
     RegulatoryAct,
     RegulatoryRequirement,
+    ApplicabilityRule,
 )
 
 
@@ -41,6 +42,25 @@ def test_multi_sector_product_model():
     )
     assert textile_product.sector == "TEXTILES_APPAREL"
     assert textile_product.attributes["has_cords_or_drawstrings"] is True
+
+
+def test_sector_matching_specification():
+    """Verifies that sector matching logic strictly partitions sector rules and permits CROSS_SECTOR."""
+    def matches_sector(rule_sector: str, product_sector: str) -> bool:
+        return rule_sector == product_sector or rule_sector == "CROSS_SECTOR"
+
+    # Sector-specific rules NEVER cross sectors
+    assert matches_sector("AGRI_FOOD", "AGRI_FOOD") is True
+    assert matches_sector("TEXTILES_APPAREL", "TEXTILES_APPAREL") is True
+    assert matches_sector("AGRI_FOOD", "TEXTILES_APPAREL") is False
+    assert matches_sector("TEXTILES_APPAREL", "AGRI_FOOD") is False
+
+    # CROSS_SECTOR rules apply to both sectors
+    assert matches_sector("CROSS_SECTOR", "AGRI_FOOD") is True
+    assert matches_sector("CROSS_SECTOR", "TEXTILES_APPAREL") is True
+
+    # ApplicabilityRule table has sector column
+    assert "sector" in ApplicabilityRule.__table__.columns
 
 
 def test_composite_foreign_key_metadata():

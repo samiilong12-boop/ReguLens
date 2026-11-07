@@ -92,10 +92,10 @@ Every API endpoint enforces:
   *This physically makes it impossible for Tenant A to insert a document or consignment referencing Tenant B's product, completely independent of software logic.*
 - **Layer 2: Application Query Scoping:**
   SQLAlchemy repository layer automatically scopes all queries to `tenant_id` extracted from the server-verified JWT.
-- **Layer 3: PostgreSQL Engine RLS:**
+- **Layer 3: PostgreSQL Engine RLS & Role Separation:**
   `ALTER TABLE ... FORCE ROW LEVEL SECURITY` applied to ALL 12 customer-associated tables:
   `tenants`, `tenant_users`, `products`, `consignments`, `documents`, `evidence_items`, `gap_analyses`, `gap_analysis_items`, `human_reviews`, `export_reports`, `background_jobs`, `audit_logs`.
-  Unprivileged runtime connection role (`regulens_app`) has `NOBYPASSRLS`.
+  Unprivileged runtime connection role (`regulens_app`) has `NOBYPASSRLS` and `NOSUPERUSER`, provisioned separately via `scripts/init_db_roles.sql`. DDL schema migration authority is strictly isolated to `regulens_migrator`.
 - **Transaction-Local Tenant Context:**
   Application checkout sets tenant context strictly within the transaction block:
   ```sql

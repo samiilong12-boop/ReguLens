@@ -53,7 +53,8 @@ Adopt **Option 3 (Defense-in-Depth: Application Scoping + Composite Foreign Keys
    - SQLAlchemy repositories automatically include `WHERE tenant_id = :tenant_id`.
 3. **Layer 3 (Database Engine RLS):**
    - `ALTER TABLE ... FORCE ROW LEVEL SECURITY` applied to: `tenants`, `tenant_users`, `products`, `consignments`, `documents`, `evidence_items`, `gap_analyses`, `gap_analysis_items`, `human_reviews`, `export_reports`, `background_jobs`, and `audit_logs`.
-   - Unprivileged runtime database role (`regulens_app`) operates with `NOBYPASSRLS`.
+   - Unprivileged runtime database role (`regulens_app`) operates with `NOBYPASSRLS` and `NOSUPERUSER`, provisioned via `scripts/init_db_roles.sql` separately from Alembic migrations.
+   - Migration owner (`regulens_migrator`) owns the schema, separating DDL authority from runtime execution.
    - On `audit_logs`, `UPDATE` and `DELETE` are revoked from `regulens_app` to ensure an immutable append-only audit trail.
 
 ### 3. Transaction-Local Tenant Context & Connection Pooling
