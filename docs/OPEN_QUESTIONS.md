@@ -49,6 +49,11 @@
 - **Recommended Default:** Use MinIO in local Docker Compose, and Cloudflare R2 or AWS S3 in production via standard `boto3` S3 client. S3 API compatibility ensures zero code changes between environments.
 - **Status:** Recommended default adopted.
 
+### Q-SEC-01: Stateless JWT Subject Validation & Active Account Status Verification
+- **Context:** `get_current_user` in `apps/api/app/api/deps.py` currently validates the JWT signature, expiration, and claims statelessly without querying the `users` table for active account status (`User.is_active`).
+- **Limitation & Phase 2 Requirement:** In Phase 1.1, full user management and account deactivation workflows are out of scope. Prior to production rollout of user management in Phase 2, `get_current_user` must inject `db: AsyncSession` to query `SELECT is_active FROM users WHERE id = :user_id`, ensuring immediate revocation of access tokens if an employee or tenant user is deactivated.
+- **Status:** Documented known limitation; scheduled as a mandatory Phase 2 security requirement before user-management rollout.
+
 ---
 
 ## 3. Product & Commercial Open Questions

@@ -46,3 +46,49 @@ async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
         text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
         {"tenant_id": str(tenant_id)},
     )
+
+
+async def verify_database_role(session: AsyncSession) -> str:
+    """Verifies that the connected database role is the unprivileged runtime role.
+    
+    Fail-closed security guarantees:
+    1. Rejects superuser connections (rolsuper == True).
+    2. Rejects roles with BYPASSRLS privilege (rolbypassrls == True).
+    3. Rejects privileged administrative roles ('postgres', 'regulens_migrator').
+    4. Enforces exact match against settings.EXPECTED_DB_RUNTIME_ROLE ('regulens_app').
+    5. Never leaks passwords in error messages or exceptions.
+    """
+    stmt = text("""
+        SELECT rolname, rolsuper, rolbypassrls
+        FROM pg_roles
+        WHERE rolname = current_user;
+    """)
+    result = await session.execute(stmt)
+    row = result.first()
+    if not row:
+        raise RuntimeError("Database role verification failed: Unable to query pg_roles for current_user.")
+
+    rolname, rolsuper, rolbypassrls = row
+
+    if rolname in {"postgres", "regulens_migrator"}:
+        raise RuntimeError(
+            f"Security violation: Application connected using privileged database role '{rolname}'. "
+            f"The application must connect exclusively using unprivileged role '{settings.EXPECTED_DB_RUNTIME_ROLE}'."
+        )
+
+    if rolsuper:
+        raise RuntimeError(
+            f"Security violation: Connected database role '{rolname}' has superuser privileges."
+        )
+
+    if rolbypassrls:
+        raise RuntimeError(
+            f"Security violation: Connected database role '{rolname}' has BYPASSRLS privilege."
+        )
+
+    if rolname != settings.EXPECTED_DB_RUNTIME_ROLE:
+        raise RuntimeError(
+            f"Security violation: Connected database role '{rolname}' does not match expected runtime role '{settings.EXPECTED_DB_RUNTIME_ROLE}'."
+        )
+
+    return rolname

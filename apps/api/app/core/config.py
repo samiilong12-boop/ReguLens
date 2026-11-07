@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     DATABASE_MIGRATION_URL: str = Field(
         default="postgresql+asyncpg://regulens_migrator:regulens_admin_pass@localhost:5432/regulens_dev"
     )
+    EXPECTED_DB_RUNTIME_ROLE: str = Field(default="regulens_app")
+    CHECK_DB_ROLE_ON_STARTUP: bool = Field(default=True)
 
     # JWT Authentication
     JWT_SECRET_KEY: str = Field(default=DEV_DEFAULT_JWT_SECRET)

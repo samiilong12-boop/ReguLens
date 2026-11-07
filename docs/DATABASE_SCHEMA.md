@@ -559,7 +559,8 @@ Database role provisioning is managed outside ordinary schema migrations using t
 - **`tenant_users` table:**
   - Isolated under RLS by `tenant_id`, preventing cross-tenant membership leakage.
 - **`audit_logs` table:**
-  - Immutable at two independent layers: RLS (no UPDATE/DELETE policy) and SQL privileges (`REVOKE UPDATE, DELETE, TRUNCATE FROM regulens_app`).
+  - Immutable at two independent layers: RLS (append-only: `SELECT` and `INSERT` policies only) and SQL engine privileges (`REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app`).
+  - The SQL revocation is executed directly inside the Alembic migration DDL immediately upon table creation, explicitly overriding any `ALTER DEFAULT PRIVILEGES` grant given to `regulens_app`.
 
 ### Setup Procedure:
 ```powershell

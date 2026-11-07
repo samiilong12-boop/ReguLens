@@ -4,12 +4,13 @@
 -- ==============================================================================
 -- Purpose:
 -- 1. Separates DDL schema migration privileges from runtime application privileges.
--- 2. Provisions the runtime role (regulens_app) with NOBYPASSRLS and NOSUPERUSER.
--- 3. Enforces immutable audit logging by revoking UPDATE, DELETE, and TRUNCATE.
+-- 2. Creates the target database (regulens_dev) if absent, with owner regulens_migrator.
+-- 3. Provisions the runtime role (regulens_app) with NOBYPASSRLS and NOSUPERUSER.
 -- 4. Establishes safe default privileges for all tables created by the migration role.
+-- 5. Defers table-level revocations (audit_logs immutability) to Alembic migration DDL.
 --
 -- Execution Instructions:
--- Execute this script as a PostgreSQL cluster administrator (e.g., 'postgres'):
+-- Execute this script using the PostgreSQL CLI ('psql') as a cluster superuser (e.g., 'postgres'):
 --
 --   psql -U postgres -d postgres -f scripts/init_db_roles.sql
 --
@@ -25,7 +26,7 @@
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_migrator') THEN
-        CREATE ROLE regulens_migrator WITH LOGIN PASSWORD 'CHANGE_MIGRATOR_PASSWORD_HERE';
+        CREATE ROLE regulens_migrator WITH LOGIN PASSWORD 'CHANGE_MIGRATOR_PASSWORD_HERE' CREATEDB;
         RAISE NOTICE 'Role regulens_migrator created.';
     ELSE
         RAISE NOTICE 'Role regulens_migrator already exists.';
@@ -54,53 +55,47 @@ ALTER ROLE regulens_app WITH
     NOINHERIT 
     NOBYPASSRLS;
 
--- 4. Grant Database Connect Privileges
+-- 4. Conditionally Create Database 'regulens_dev' with Owner 'regulens_migrator'
+-- Note: In PostgreSQL, CREATE DATABASE cannot run inside a transaction block.
+-- The query below uses psql \gexec to dynamically execute CREATE DATABASE only when absent.
+SELECT 'CREATE DATABASE regulens_dev WITH OWNER regulens_migrator'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'regulens_dev')\gexec
+
+-- 5. Grant Database Connect Privileges
 GRANT CONNECT ON DATABASE regulens_dev TO regulens_migrator;
 GRANT CONNECT ON DATABASE regulens_dev TO regulens_app;
 
--- Connect to target database
+-- 6. Connect to Target Database
 \c regulens_dev
 
--- 5. Schema Ownership & DDL Privileges
+-- 7. Schema Ownership & DDL Privileges
 -- The migration role owns the public schema and executes Alembic migrations.
 GRANT ALL ON SCHEMA public TO regulens_migrator;
 ALTER SCHEMA public OWNER TO regulens_migrator;
 
--- 6. Runtime Role Schema Usage
+-- 8. Runtime Role Schema Usage
 -- The runtime role can execute queries within the public schema, but cannot alter schema DDL.
 GRANT USAGE ON SCHEMA public TO regulens_app;
 
--- 7. Table Level Data Access Privileges
--- Grant standard CRUD operations to the runtime role on all current tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO regulens_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO regulens_app;
-
--- 8. Immutable Audit Log Enforcement
--- Revoke UPDATE, DELETE, and TRUNCATE on audit_logs from the runtime role.
--- Even if an attacker attempts an update via application credentials, PostgreSQL rejects it at the SQL engine layer.
-REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app;
-
--- Prevent table truncation across all tables by runtime role
-REVOKE TRUNCATE ON ALL TABLES IN SCHEMA public FROM regulens_app;
-
--- 9. Default Privileges for Future Tables
--- When regulens_migrator creates new tables via Alembic migrations, grant CRUD to regulens_app automatically.
+-- 9. Default Privileges for Future Tables Created by regulens_migrator
+-- When regulens_migrator creates new tables via Alembic migrations, grant DML to regulens_app automatically.
 ALTER DEFAULT PRIVILEGES FOR ROLE regulens_migrator IN SCHEMA public 
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO regulens_app;
 
 ALTER DEFAULT PRIVILEGES FOR ROLE regulens_migrator IN SCHEMA public 
     GRANT USAGE, SELECT ON SEQUENCES TO regulens_app;
 
--- Ensure audit_logs immutability is maintained if recreated
+-- Prevent table truncation across all future tables by runtime role
 ALTER DEFAULT PRIVILEGES FOR ROLE regulens_migrator IN SCHEMA public 
     REVOKE TRUNCATE ON TABLES FROM regulens_app;
 
 -- ==============================================================================
--- Verification Queries (Run after execution):
--- 1. Check role attributes:
---    SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname IN ('regulens_app', 'regulens_migrator');
---    Expected: regulens_app -> rolsuper=f, rolbypassrls=f
--- 2. Check audit_logs privileges:
---    SELECT grantee, privilege_type FROM information_schema.role_table_grants WHERE table_name = 'audit_logs' AND grantee = 'regulens_app';
---    Expected: SELECT, INSERT only (NO UPDATE, NO DELETE).
+-- NOTE ON AUDIT_LOGS IMMUTABILITY:
+-- Tables do not exist at role provisioning time. Table creation is performed by
+-- Alembic migrations (alembic upgrade head).
+--
+-- To prevent default privilege leakage (ALTER DEFAULT PRIVILEGES granting UPDATE/DELETE),
+-- the Alembic migration (0001_initial_schema.py) explicitly executes revocation of
+-- UPDATE, DELETE, and TRUNCATE privileges on audit_logs from regulens_app
+-- immediately after audit_logs is created, backed by append-only RLS policies.
 -- ==============================================================================

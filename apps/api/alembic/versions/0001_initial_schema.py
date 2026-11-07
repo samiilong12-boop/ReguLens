@@ -397,6 +397,20 @@ def upgrade() -> None:
             WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
     """)
 
+    # 13. Audit Log Privilege Hardening (SQL Engine Permission Layer)
+    # Explicitly revoke UPDATE, DELETE, and TRUNCATE from the runtime application role (regulens_app).
+    # This overrides ALTER DEFAULT PRIVILEGES, ensuring audit_logs is append-only at both
+    # the SQL privilege layer and the RLS policy layer.
+    op.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_app') THEN
+                REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app;
+            END IF;
+        END
+        $$;
+    """)
+
 
 def downgrade() -> None:
     # Drop all in reverse order
