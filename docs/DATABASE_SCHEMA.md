@@ -559,8 +559,9 @@ Database role provisioning is managed outside ordinary schema migrations using t
 - **`tenant_users` table:**
   - Isolated under RLS by `tenant_id`, preventing cross-tenant membership leakage.
 - **`audit_logs` table:**
-  - Immutable at two independent layers: RLS (append-only: `SELECT` and `INSERT` policies only) and SQL engine privileges (`REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app`).
+  - Immutable at two independent layers: RLS (append-only: `SELECT` and `INSERT` policies only) and SQL engine privileges (`REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app`).
   - The SQL revocation is executed directly inside the Alembic migration DDL immediately upon table creation, explicitly overriding any `ALTER DEFAULT PRIVILEGES` grant given to `regulens_app`.
+  - Database ownership is actively verified via PostgreSQL system catalog inspection in `scripts/init_db_roles.sql`, and runtime role least-privilege status is asserted fail-closed on startup via `DatabaseSecurityError` in `app/main.py` and `app/db/session.py`.
 
 ### Setup Procedure:
 ```powershell

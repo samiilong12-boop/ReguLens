@@ -30,13 +30,23 @@ def test_init_db_roles_provisioning_order():
     assert create_db_idx < grant_connect_idx, "Database must be created before granting connect privileges."
     assert grant_connect_idx < connect_cmd_idx, r"Connect privileges must be granted before \c regulens_dev."
 
-    # 3. No premature reference to non-existent audit_logs table
+    # 3. Safe existing database ownership reassignment and catalog assertion
+    alter_db_idx = content.find("ALTER DATABASE regulens_dev OWNER TO regulens_migrator")
+    assert alter_db_idx != -1, "ALTER DATABASE ownership reassignment query missing."
+    assert r"\gexec" in content[alter_db_idx : alter_db_idx + 250], r"\gexec must be used to execute ALTER DATABASE outside transaction."
+
+    ownership_check_idx = content.find("Database regulens_dev ownership verified: regulens_migrator")
+    assert ownership_check_idx != -1, "Catalog ownership assertion DO block missing."
+    assert "pg_database" in content[alter_db_idx:], "Ownership check must query pg_database catalog."
+    assert "pg_roles" in content[alter_db_idx:], "Ownership check must query pg_roles catalog."
+
+    # 4. No premature reference to non-existent audit_logs table
     assert "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs" not in content, (
         "scripts/init_db_roles.sql must not attempt to revoke privileges on table audit_logs "
         "before migrations have created it."
     )
 
-    # 4. Default privileges apply to objects created by regulens_migrator
+    # 5. Default privileges apply to objects created by regulens_migrator
     assert "ALTER DEFAULT PRIVILEGES FOR ROLE regulens_migrator IN SCHEMA public" in content
 
 
@@ -59,8 +69,8 @@ def test_migration_audit_logs_revocation_order():
         create_table_idx = content.find('op.create_table(\r\n        "audit_logs"')
     assert create_table_idx != -1, 'Table creation for "audit_logs" missing.'
 
-    revoke_idx = content.find("REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app;")
-    assert revoke_idx != -1, "Explicit REVOKE on audit_logs from regulens_app missing in migration."
+    revoke_idx = content.find("REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app;")
+    assert revoke_idx != -1, "Explicit REVOKE on public.audit_logs from regulens_app missing in migration."
 
     # Verify that REVOKE happens AFTER table creation
     assert create_table_idx < revoke_idx, "REVOKE on audit_logs must execute after table creation."

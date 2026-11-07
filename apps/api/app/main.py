@@ -15,27 +15,37 @@ async def lifespan(app: FastAPI):
     logger.info("application_startup", service=settings.PROJECT_NAME, environment=settings.ENVIRONMENT)
 
     if settings.CHECK_DB_ROLE_ON_STARTUP:
-        from app.db.session import async_session_maker, verify_database_role
+        from app.db.session import async_session_maker, verify_database_role, DatabaseSecurityError
         try:
             async with async_session_maker() as session:
-                connected_role = await verify_database_role(session)
-                logger.info("database_role_verified", role=connected_role)
-        except Exception as exc:
-            # If the database responded but violated security policy, fail immediately in all environments
-            if isinstance(exc, RuntimeError) and "Security violation" in str(exc):
-                logger.critical("database_security_violation", error=str(exc))
-                raise
-
-            # If the connection itself failed (e.g. database not reachable)
+                try:
+                    connected_role = await verify_database_role(session)
+                    logger.info("database_role_verified", role=connected_role)
+                except DatabaseSecurityError as sec_err:
+                    logger.critical("database_security_violation", error=str(sec_err))
+                    raise
+                except Exception as query_err:
+                    logger.critical("database_role_verification_query_failed", error=str(query_err))
+                    raise DatabaseSecurityError(
+                        f"Database is reachable but role verification query failed: {query_err}"
+                    ) from query_err
+        except DatabaseSecurityError:
+            # Re-raise security errors unconditionally across ALL environments (including development)
+            raise
+        except Exception as conn_err:
+            # Database connection acquisition failed (e.g. database offline or network unreachable)
             env = (settings.ENVIRONMENT or "").strip().lower()
             if env in {"production", "prod", "staging"}:
-                logger.critical("database_connection_failed_production", error=str(exc))
-                raise RuntimeError("Production startup failed: Unable to connect to database to verify security boundaries.") from exc
+                logger.critical("database_connection_failed_production", error=str(conn_err))
+                raise RuntimeError(
+                    "Production startup failed: Unable to connect to database to verify security boundaries."
+                ) from conn_err
             else:
                 logger.warning(
                     "database_unreachable_startup",
                     warning="PostgreSQL is not reachable on startup. Database role verification was NOT RUN.",
                     environment=env,
+                    error=str(conn_err),
                 )
 
     yield

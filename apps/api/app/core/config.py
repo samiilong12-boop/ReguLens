@@ -72,6 +72,17 @@ class Settings(BaseSettings):
         if not env:
             raise ValueError("Environment configuration is missing or ambiguous. System fails closed.")
 
+        # Validate EXPECTED_DB_RUNTIME_ROLE across all environments
+        expected_role = (self.EXPECTED_DB_RUNTIME_ROLE or "").strip()
+        if not expected_role:
+            raise ValueError(
+                "Database security configuration error: EXPECTED_DB_RUNTIME_ROLE cannot be empty or whitespace."
+            )
+        if expected_role in {"postgres", "regulens_migrator"}:
+            raise ValueError(
+                f"Database security configuration error: Privileged role '{expected_role}' cannot be configured as EXPECTED_DB_RUNTIME_ROLE."
+            )
+
         if is_production:
             if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY == DEV_DEFAULT_JWT_SECRET:
                 raise ValueError(
@@ -85,6 +96,14 @@ class Settings(BaseSettings):
             if self.ALLOW_DEV_TENANT_BYPASS:
                 raise ValueError(
                     "Production startup failed: ALLOW_DEV_TENANT_BYPASS cannot be enabled in a production environment."
+                )
+            if not self.CHECK_DB_ROLE_ON_STARTUP:
+                raise ValueError(
+                    "Production startup failed: CHECK_DB_ROLE_ON_STARTUP cannot be disabled in production/staging environments."
+                )
+            if expected_role != "regulens_app":
+                raise ValueError(
+                    f"Production startup failed: EXPECTED_DB_RUNTIME_ROLE in production must be 'regulens_app', got '{expected_role}'."
                 )
         else:
             # Non-production: if bypass is requested, ensure environment is strictly 'development'

@@ -48,6 +48,11 @@ async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
     )
 
 
+class DatabaseSecurityError(RuntimeError):
+    """Raised when connected database role violates security boundaries or role verification fails."""
+    pass
+
+
 async def verify_database_role(session: AsyncSession) -> str:
     """Verifies that the connected database role is the unprivileged runtime role.
     
@@ -57,6 +62,7 @@ async def verify_database_role(session: AsyncSession) -> str:
     3. Rejects privileged administrative roles ('postgres', 'regulens_migrator').
     4. Enforces exact match against settings.EXPECTED_DB_RUNTIME_ROLE ('regulens_app').
     5. Never leaks passwords in error messages or exceptions.
+    6. Raises DatabaseSecurityError on any security policy violation or verification failure.
     """
     stmt = text("""
         SELECT rolname, rolsuper, rolbypassrls
@@ -66,28 +72,28 @@ async def verify_database_role(session: AsyncSession) -> str:
     result = await session.execute(stmt)
     row = result.first()
     if not row:
-        raise RuntimeError("Database role verification failed: Unable to query pg_roles for current_user.")
+        raise DatabaseSecurityError("Database role verification failed: Unable to query pg_roles for current_user.")
 
     rolname, rolsuper, rolbypassrls = row
 
     if rolname in {"postgres", "regulens_migrator"}:
-        raise RuntimeError(
+        raise DatabaseSecurityError(
             f"Security violation: Application connected using privileged database role '{rolname}'. "
             f"The application must connect exclusively using unprivileged role '{settings.EXPECTED_DB_RUNTIME_ROLE}'."
         )
 
     if rolsuper:
-        raise RuntimeError(
+        raise DatabaseSecurityError(
             f"Security violation: Connected database role '{rolname}' has superuser privileges."
         )
 
     if rolbypassrls:
-        raise RuntimeError(
+        raise DatabaseSecurityError(
             f"Security violation: Connected database role '{rolname}' has BYPASSRLS privilege."
         )
 
     if rolname != settings.EXPECTED_DB_RUNTIME_ROLE:
-        raise RuntimeError(
+        raise DatabaseSecurityError(
             f"Security violation: Connected database role '{rolname}' does not match expected runtime role '{settings.EXPECTED_DB_RUNTIME_ROLE}'."
         )
 

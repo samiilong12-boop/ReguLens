@@ -14,6 +14,11 @@
 --
 --   psql -U postgres -d postgres -f scripts/init_db_roles.sql
 --
+-- REQUIRED PRIVILEGES:
+-- The executing account MUST possess cluster superuser privileges (or CREATEROLE and ownership
+-- of regulens_dev). Superuser privileges are required to provision login roles with specific attributes,
+-- assign database ownership to regulens_migrator, and alter existing database ownership safely.
+--
 -- IMPORTANT SECURITY NOTICE:
 -- - NEVER commit production passwords to version control.
 -- - Replace placeholders 'CHANGE_MIGRATOR_PASSWORD_HERE' and 'CHANGE_APP_PASSWORD_HERE'
@@ -60,6 +65,43 @@ ALTER ROLE regulens_app WITH
 -- The query below uses psql \gexec to dynamically execute CREATE DATABASE only when absent.
 SELECT 'CREATE DATABASE regulens_dev WITH OWNER regulens_migrator'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'regulens_dev')\gexec
+
+-- 4b. Reassign Database Ownership to 'regulens_migrator' If Owned by Another Role
+-- If regulens_dev already existed with an owner other than regulens_migrator (e.g. postgres),
+-- dynamically execute ALTER DATABASE outside of a transaction block using \gexec.
+-- Note: In PostgreSQL, ALTER DATABASE cannot run inside a transaction block.
+SELECT 'ALTER DATABASE regulens_dev OWNER TO regulens_migrator'
+FROM pg_database d
+JOIN pg_roles r ON d.datdba = r.oid
+WHERE d.datname = 'regulens_dev' AND r.rolname <> 'regulens_migrator'\gexec
+
+-- 4c. Verify Database Ownership (Catalog Assertion)
+-- Enforces that regulens_dev is strictly owned by regulens_migrator.
+-- If ownership is incorrect (e.g. if ALTER DATABASE was skipped or failed due to insufficient privileges),
+-- abort execution immediately with a clear error and required remediation instructions.
+DO $$
+DECLARE
+    actual_owner text;
+    executing_user text;
+BEGIN
+    SELECT r.rolname INTO actual_owner
+    FROM pg_database d
+    JOIN pg_roles r ON d.datdba = r.oid
+    WHERE d.datname = 'regulens_dev';
+
+    IF actual_owner IS NULL THEN
+        RAISE EXCEPTION 'Database regulens_dev does not exist after creation step.';
+    END IF;
+
+    IF actual_owner <> 'regulens_migrator' THEN
+        SELECT current_user INTO executing_user;
+        RAISE EXCEPTION 'Security error: Database regulens_dev is owned by ''%'' instead of expected owner ''regulens_migrator''. Current executing user is ''%''. Reassigning database ownership requires cluster superuser privileges. Remediation: Run as superuser: ALTER DATABASE regulens_dev OWNER TO regulens_migrator;',
+            actual_owner, executing_user;
+    ELSE
+        RAISE NOTICE 'Database regulens_dev ownership verified: regulens_migrator.';
+    END IF;
+END
+$$;
 
 -- 5. Grant Database Connect Privileges
 GRANT CONNECT ON DATABASE regulens_dev TO regulens_migrator;

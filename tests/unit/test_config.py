@@ -86,3 +86,71 @@ def test_missing_or_ambiguous_environment_fails_closed():
         Settings(ENVIRONMENT="")
     assert "Environment configuration is missing or ambiguous" in str(excinfo.value)
 
+
+def test_production_fails_when_check_db_role_on_startup_disabled():
+    """Production startup must fail closed if CHECK_DB_ROLE_ON_STARTUP is set to False."""
+    strong_secret = "c" * 32 + "_production_unique_entropy_key_check_db"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            CHECK_DB_ROLE_ON_STARTUP=False,
+        )
+    assert "CHECK_DB_ROLE_ON_STARTUP cannot be disabled in production/staging environments" in str(excinfo.value)
+
+
+def test_staging_fails_when_check_db_role_on_startup_disabled():
+    """Staging startup must fail closed if CHECK_DB_ROLE_ON_STARTUP is set to False."""
+    strong_secret = "d" * 32 + "_staging_unique_entropy_key_check_db"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="staging",
+            JWT_SECRET_KEY=strong_secret,
+            CHECK_DB_ROLE_ON_STARTUP=False,
+        )
+    assert "CHECK_DB_ROLE_ON_STARTUP cannot be disabled in production/staging environments" in str(excinfo.value)
+
+
+def test_empty_or_whitespace_expected_db_runtime_role_rejected():
+    """Empty or whitespace EXPECTED_DB_RUNTIME_ROLE must be rejected across all environments."""
+    with pytest.raises(ValueError) as excinfo:
+        Settings(EXPECTED_DB_RUNTIME_ROLE="")
+    assert "EXPECTED_DB_RUNTIME_ROLE cannot be empty or whitespace" in str(excinfo.value)
+
+    with pytest.raises(ValueError) as excinfo:
+        Settings(EXPECTED_DB_RUNTIME_ROLE="   ")
+    assert "EXPECTED_DB_RUNTIME_ROLE cannot be empty or whitespace" in str(excinfo.value)
+
+
+def test_privileged_roles_rejected_as_expected_runtime_role():
+    """Privileged roles 'postgres' and 'regulens_migrator' cannot be set as EXPECTED_DB_RUNTIME_ROLE."""
+    with pytest.raises(ValueError) as excinfo:
+        Settings(EXPECTED_DB_RUNTIME_ROLE="postgres")
+    assert "Privileged role 'postgres' cannot be configured" in str(excinfo.value)
+
+    with pytest.raises(ValueError) as excinfo:
+        Settings(EXPECTED_DB_RUNTIME_ROLE="regulens_migrator")
+    assert "Privileged role 'regulens_migrator' cannot be configured" in str(excinfo.value)
+
+
+def test_production_rejects_non_regulens_app_expected_runtime_role():
+    """Production must reject any expected role other than 'regulens_app'."""
+    strong_secret = "e" * 32 + "_production_unique_entropy_key_role_name"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            EXPECTED_DB_RUNTIME_ROLE="custom_app_role",
+        )
+    assert "EXPECTED_DB_RUNTIME_ROLE in production must be 'regulens_app'" in str(excinfo.value)
+
+
+def test_development_allows_check_db_role_on_startup_false_if_explicitly_configured():
+    """Development environment permits disabling CHECK_DB_ROLE_ON_STARTUP for testing."""
+    dev_settings = Settings(
+        ENVIRONMENT="development",
+        CHECK_DB_ROLE_ON_STARTUP=False,
+    )
+    assert dev_settings.CHECK_DB_ROLE_ON_STARTUP is False
+
+

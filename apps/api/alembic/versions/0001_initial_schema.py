@@ -405,7 +405,7 @@ def upgrade() -> None:
         DO $$
         BEGIN
             IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_app') THEN
-                REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_logs FROM regulens_app;
+                REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app;
             END IF;
         END
         $$;
