@@ -139,11 +139,25 @@ ALTER DEFAULT PRIVILEGES FOR ROLE regulens_migrator IN SCHEMA public
 
 -- ==============================================================================
 -- NOTE ON AUDIT_LOGS IMMUTABILITY:
--- Tables do not exist at role provisioning time. Table creation is performed by
+-- Tables do not exist at initial role provisioning time. Table creation is performed by
 -- Alembic migrations (alembic upgrade head).
 --
 -- To prevent default privilege leakage (ALTER DEFAULT PRIVILEGES granting UPDATE/DELETE),
 -- the Alembic migration (0001_initial_schema.py) explicitly executes revocation of
 -- UPDATE, DELETE, and TRUNCATE privileges on audit_logs from regulens_app
 -- immediately after audit_logs is created, backed by append-only RLS policies.
+--
+-- Defensive Privilege Enforcement on Pre-existing Tables:
+-- If scripts/init_db_roles.sql is re-executed on an existing database where audit_logs
+-- is already provisioned, unconditionally guarantee that UPDATE, DELETE, and TRUNCATE
+-- remain revoked from regulens_app.
 -- ==============================================================================
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'audit_logs') THEN
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_app') THEN
+            REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app;
+        END IF;
+    END IF;
+END
+$$;

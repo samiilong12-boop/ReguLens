@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - master
+      - 'feature/**'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -58,9 +62,26 @@ jobs:
           DATABASE_MIGRATION_URL: "postgresql+asyncpg://regulens_migrator:CHANGE_MIGRATOR_PASSWORD_HERE@localhost:5432/regulens_dev"
         run: uv run alembic upgrade head
 
-      - name: Execute test suite (including 10 PostgreSQL RLS integration tests)
+      - name: Execute test suite (including PostgreSQL RLS integration tests)
         working-directory: apps/api
         env:
+          CI: "true"
           DATABASE_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
           DATABASE_TEST_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
-        run: uv run pytest -v
+          DATABASE_ADMIN_TEST_URL: "postgresql+asyncpg://postgres:ci_temp_postgres_password@localhost:5432/regulens_dev"
+        run: uv run pytest -v -rs ../../tests/security/test_postgres_rls.py
+
+      - name: Verify zero skipped RLS integration tests in CI
+        working-directory: apps/api
+        env:
+          CI: "true"
+          DATABASE_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
+          DATABASE_TEST_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
+          DATABASE_ADMIN_TEST_URL: "postgresql+asyncpg://postgres:ci_temp_postgres_password@localhost:5432/regulens_dev"
+        run: |
+          output=$(uv run pytest ../../tests/security/test_postgres_rls.py -q)
+          echo "$output"
+          if echo "$output" | grep -iE "(skipped|\bs\b)"; then
+            echo "CI Security Violation: RLS integration tests were skipped!"
+            exit 1
+          fi

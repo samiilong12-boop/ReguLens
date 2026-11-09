@@ -1,6 +1,7 @@
 """Database session management and transaction-local tenant context binding."""
 from uuid import UUID
 from typing import AsyncGenerator
+from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
@@ -18,9 +19,20 @@ engine = create_async_engine(
     max_overflow=20,
 )
 
+
+class ReguLensAppSession(Session):
+    """Dedicated SQLAlchemy sync session subclass for runtime application sessions only.
+    
+    Ensures transaction-level event listeners are strictly scoped to the application
+    runtime and are never inherited by administrative test or migration sessions.
+    """
+    pass
+
+
 async_session_maker = async_sessionmaker(
     engine,
     class_=AsyncSession,
+    sync_session_class=ReguLensAppSession,
     expire_on_commit=False,
     autocommit=False,
     autoflush=False,
@@ -41,7 +53,9 @@ async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
     
     Using the third argument `is_local = true` ensures the configuration is strictly
     scoped to the current database transaction and automatically cleared upon commit/rollback.
+    Also records tenant_id in session.sync_session.info for the application session lifecycle.
     """
+    session.sync_session.info["tenant_id"] = tenant_id
     await session.execute(
         text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
         {"tenant_id": str(tenant_id)},
