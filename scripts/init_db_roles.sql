@@ -31,7 +31,7 @@
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_migrator') THEN
-        CREATE ROLE regulens_migrator WITH LOGIN PASSWORD 'CHANGE_MIGRATOR_PASSWORD_HERE' CREATEDB;
+        CREATE ROLE regulens_migrator WITH LOGIN PASSWORD 'CHANGE_MIGRATOR_PASSWORD_HERE' NOCREATEDB;
         RAISE NOTICE 'Role regulens_migrator created.';
     ELSE
         RAISE NOTICE 'Role regulens_migrator already exists.';
@@ -52,6 +52,10 @@ END
 $$;
 
 -- 3. Enforce Role Attributes (Defense-in-Depth)
+-- Explicitly guarantee that regulens_migrator has NOCREATEDB, even if pre-existing.
+-- Per ADR-0008, regulens_migrator only requires schema DDL within the database, not CREATEDB.
+ALTER ROLE regulens_migrator WITH NOCREATEDB;
+
 -- The runtime application role MUST NEVER have superuser privileges or BYPASSRLS.
 ALTER ROLE regulens_app WITH 
     NOSUPERUSER 
@@ -61,12 +65,14 @@ ALTER ROLE regulens_app WITH
     NOBYPASSRLS;
 
 -- 4. Conditionally Create Database 'regulens_dev' with Owner 'regulens_migrator'
+-- Executed by 'postgres' (which possesses CREATEDB and administrative privileges).
 -- Note: In PostgreSQL, CREATE DATABASE cannot run inside a transaction block.
 -- The query below uses psql \gexec to dynamically execute CREATE DATABASE only when absent.
 SELECT 'CREATE DATABASE regulens_dev WITH OWNER regulens_migrator'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'regulens_dev')\gexec
 
 -- 4b. Reassign Database Ownership to 'regulens_migrator' If Owned by Another Role
+-- Executed by 'postgres' (which possesses CREATEDB and database ownership).
 -- If regulens_dev already existed with an owner other than regulens_migrator (e.g. postgres),
 -- dynamically execute ALTER DATABASE outside of a transaction block using \gexec.
 -- Note: In PostgreSQL, ALTER DATABASE cannot run inside a transaction block.
