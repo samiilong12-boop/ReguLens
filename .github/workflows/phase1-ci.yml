@@ -1,6 +1,9 @@
 name: Phase 1 CI Verification
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
