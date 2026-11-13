@@ -69,9 +69,10 @@ jobs:
           DATABASE_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
           DATABASE_TEST_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
           DATABASE_ADMIN_TEST_URL: "postgresql+asyncpg://postgres:ci_temp_postgres_password@localhost:5432/regulens_dev"
-        run: uv run pytest -v -rs ../../tests/security/test_postgres_rls.py
+        run: uv run pytest -c pyproject.toml -v -rs ../../tests/security/test_postgres_rls.py
 
       - name: Verify zero skipped RLS integration tests in CI
+        if: always()
         working-directory: apps/api
         env:
           CI: "true"
@@ -79,7 +80,7 @@ jobs:
           DATABASE_TEST_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
           DATABASE_ADMIN_TEST_URL: "postgresql+asyncpg://postgres:ci_temp_postgres_password@localhost:5432/regulens_dev"
         run: |
-          output=$(uv run pytest ../../tests/security/test_postgres_rls.py -q)
+          output=$(uv run pytest -c pyproject.toml ../../tests/security/test_postgres_rls.py -q || true)
           echo "$output"
           if echo "$output" | grep -iE "(skipped|\bs\b)"; then
             echo "CI Security Violation: RLS integration tests were skipped!"

@@ -26,6 +26,7 @@ import uuid
 from typing import AsyncGenerator, Tuple
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
@@ -84,7 +85,7 @@ else:
         )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provides an isolated async database session using the runtime role connection (regulens_app)."""
     test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
@@ -94,7 +95,7 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
     await test_engine.dispose()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def admin_session() -> AsyncGenerator[AsyncSession, None]:
     """Provides an administrative database session (connecting with SUPERUSER / BYPASSRLS).
     
@@ -109,7 +110,7 @@ async def admin_session() -> AsyncGenerator[AsyncSession, None]:
     await admin_engine.dispose()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def provisioned_tenants(
     admin_session: AsyncSession,
 ) -> AsyncGenerator[Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID], None]:
@@ -174,7 +175,7 @@ async def provisioned_tenants(
 # TEST SUITE
 # ==============================================================================
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_runtime_role_cannot_bypass_rls(db_session: AsyncSession):
     """Verifies that the connection role is regulens_app and has NOBYPASSRLS and NOSUPERUSER."""
     query = text("""
@@ -194,7 +195,7 @@ async def test_runtime_role_cannot_bypass_rls(db_session: AsyncSession):
     assert rolbypassrls is False, f"Security violation: Runtime role '{rolname}' has BYPASSRLS privilege."
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_admin_session_does_not_inherit_application_listener(admin_session: AsyncSession):
     """Verifies that administrative test sessions use standard Session and do not inherit ReguLensAppSession."""
     sync_session = admin_session.sync_session
@@ -203,7 +204,7 @@ async def test_admin_session_does_not_inherit_application_listener(admin_session
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_own_tenant_crud_positive_control(
     db_session: AsyncSession,
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
@@ -243,7 +244,7 @@ async def test_own_tenant_crud_positive_control(
     await db_session.commit()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_cross_tenant_read_isolation(
     db_session: AsyncSession,
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
@@ -257,7 +258,7 @@ async def test_cross_tenant_read_isolation(
     assert result.scalar_one_or_none() is None, "RLS Breach: Tenant A was able to read Tenant B's product!"
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_cross_tenant_write_isolation(
     db_session: AsyncSession,
     admin_session: AsyncSession,
@@ -289,7 +290,7 @@ async def test_cross_tenant_write_isolation(
     assert prod_b.name == "Product B Baseline"
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_cross_tenant_insert_rejected_by_rls(
     db_session: AsyncSession,
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
@@ -326,7 +327,7 @@ async def test_cross_tenant_insert_rejected_by_rls(
     await db_session.rollback()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_audit_logs_immutability_enforced_by_privilege(
     db_session: AsyncSession,
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
@@ -381,7 +382,7 @@ async def test_audit_logs_immutability_enforced_by_privilege(
     assert "permission denied for table audit_logs" in str(orig_del).lower()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_never_defined_custom_guc_returns_zero_rows():
     """Verifies that on a genuinely new physical connection where the GUC was never defined,
     current_setting returns NULL and querying protected tables returns 0 rows without error.
@@ -397,7 +398,7 @@ async def test_never_defined_custom_guc_returns_zero_rows():
     await engine.dispose()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_single_conn_post_commit_guc_empty_string_reproduction():
     """Reproduces the post-COMMIT custom GUC behavior on a single physical connection.
     
@@ -432,7 +433,7 @@ async def test_single_conn_post_commit_guc_empty_string_reproduction():
     await engine.dispose()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_missing_tenant_context_returns_zero_rows(db_session: AsyncSession):
     """Missing or reset tenant context must return zero rows for all customer tables.
     
@@ -445,7 +446,7 @@ async def test_missing_tenant_context_returns_zero_rows(db_session: AsyncSession
     assert len(result.scalars().all()) == 0
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_real_application_path_post_commit_integration(
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
 ):
