@@ -70,6 +70,30 @@ jobs:
           uv run alembic downgrade -1
           uv run alembic upgrade head
 
+      - name: Inject temporary unsafe privileges on audit_logs for idempotency testing
+        env:
+          PGPASSWORD: ci_temp_postgres_password
+        run: |
+          echo "Granting UPDATE, DELETE, TRUNCATE on audit_logs to regulens_app..."
+          psql -h localhost -p 5432 -U postgres -d regulens_dev -v ON_ERROR_STOP=1 -c "
+            GRANT UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs TO regulens_app;
+          "
+          echo "Verifying precondition: asserting unsafe privileges are actually present..."
+          psql -h localhost -p 5432 -U postgres -d regulens_dev -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT (
+                has_table_privilege('regulens_app', 'public.audit_logs', 'UPDATE') AND
+                has_table_privilege('regulens_app', 'public.audit_logs', 'DELETE') AND
+                has_table_privilege('regulens_app', 'public.audit_logs', 'TRUNCATE')
+              ) THEN
+                RAISE EXCEPTION 'Idempotency test precondition failed: unsafe privileges were not granted!';
+              END IF;
+              RAISE NOTICE 'Precondition verified: regulens_app has UPDATE, DELETE, TRUNCATE on audit_logs.';
+            END
+            \$\$;
+          "
+
       - name: Re-execute database role provisioning (idempotency verification)
         env:
           PGPASSWORD: ci_temp_postgres_password

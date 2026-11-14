@@ -878,26 +878,16 @@ async def test_init_db_roles_idempotency_audit_logs_privileges(
     db_session: AsyncSession,
     provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
 ):
-    """Integration Test: Verifies that re-executing init_db_roles.sql on an existing database
-    with audit_logs maintains revoked UPDATE/DELETE/TRUNCATE on audit_logs and does not
-    affect privileges on unrelated tables (e.g. products).
-    """
-    # 1. Execute the actual idempotent DO block from scripts/init_db_roles.sql via admin_session
-    idempotent_block = text("""
-        DO $$
-        BEGIN
-            IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'audit_logs') THEN
-                IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_app') THEN
-                    REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app;
-                END IF;
-            END IF;
-        END
-        $$;
-    """)
-    await admin_session.execute(idempotent_block)
-    await admin_session.commit()
+    """Integration Test: Verifies that after scripts/init_db_roles.sql has executed against
+    an existing database with audit_logs (where unsafe privileges were injected beforehand),
+    the script's defensive DO block successfully revoked UPDATE, DELETE, and TRUNCATE from regulens_app,
+    while maintaining required privileges on audit_logs and unrelated tables (e.g. products).
 
-    # 2. Assert exact privilege matrix for regulens_app on audit_logs
+    Crucially: This test does NOT execute any DO ... REVOKE block itself. It inspects the actual
+    privileges left behind by the full execution of scripts/init_db_roles.sql. If the script loses its
+    defensive revocation block, this test will strictly fail.
+    """
+    # 1. Assert exact privilege matrix for regulens_app on audit_logs left by scripts/init_db_roles.sql
     priv_checks = await admin_session.execute(text("""
         SELECT 
             has_table_privilege('regulens_app', 'public.audit_logs', 'SELECT') AS can_select,
@@ -907,13 +897,22 @@ async def test_init_db_roles_idempotency_audit_logs_privileges(
             has_table_privilege('regulens_app', 'public.audit_logs', 'TRUNCATE') AS can_truncate;
     """))
     row = priv_checks.mappings().one()
-    assert row["can_select"] is True, "regulens_app lost SELECT on audit_logs!"
-    assert row["can_insert"] is True, "regulens_app lost INSERT on audit_logs!"
-    assert row["can_update"] is False, "Security violation: regulens_app has UPDATE on audit_logs!"
-    assert row["can_delete"] is False, "Security violation: regulens_app has DELETE on audit_logs!"
-    assert row["can_truncate"] is False, "Security violation: regulens_app has TRUNCATE on audit_logs!"
+    assert row["can_select"] is True, "Defect: regulens_app lost SELECT on audit_logs!"
+    assert row["can_insert"] is True, "Defect: regulens_app lost INSERT on audit_logs!"
+    assert row["can_update"] is False, (
+        "Security violation: regulens_app has UPDATE on audit_logs! "
+        "scripts/init_db_roles.sql failed to revoke UPDATE during re-execution."
+    )
+    assert row["can_delete"] is False, (
+        "Security violation: regulens_app has DELETE on audit_logs! "
+        "scripts/init_db_roles.sql failed to revoke DELETE during re-execution."
+    )
+    assert row["can_truncate"] is False, (
+        "Security violation: regulens_app has TRUNCATE on audit_logs! "
+        "scripts/init_db_roles.sql failed to revoke TRUNCATE during re-execution."
+    )
 
-    # 3. Assert privileges on unrelated tables (e.g. products) remain intact
+    # 2. Assert privileges on unrelated tables (e.g. products) remain intact
     prod_priv_checks = await admin_session.execute(text("""
         SELECT 
             has_table_privilege('regulens_app', 'public.products', 'SELECT') AS can_select,
@@ -922,12 +921,12 @@ async def test_init_db_roles_idempotency_audit_logs_privileges(
             has_table_privilege('regulens_app', 'public.products', 'DELETE') AS can_delete;
     """))
     prod_row = prod_priv_checks.mappings().one()
-    assert prod_row["can_select"] is True
-    assert prod_row["can_insert"] is True
-    assert prod_row["can_update"] is True
-    assert prod_row["can_delete"] is True
+    assert prod_row["can_select"] is True, "Defect: regulens_app lost SELECT on products!"
+    assert prod_row["can_insert"] is True, "Defect: regulens_app lost INSERT on products!"
+    assert prod_row["can_update"] is True, "Defect: regulens_app lost UPDATE on products!"
+    assert prod_row["can_delete"] is True, "Defect: regulens_app lost DELETE on products!"
 
-    # 4. Under db_session (as regulens_app), verify UPDATE/DELETE on audit_logs is rejected by SQL privilege denial (SQLSTATE 42501)
+    # 3. Under db_session (as regulens_app), verify UPDATE and DELETE on audit_logs are rejected by SQL privilege denial (SQLSTATE 42501)
     tenant_a = provisioned_tenants[0]
     await set_tenant_context(db_session, tenant_a)
     with pytest.raises(DBAPIError) as excinfo_upd:
@@ -936,4 +935,12 @@ async def test_init_db_roles_idempotency_audit_logs_privileges(
             {"tid": str(tenant_a)},
         )
     assert getattr(excinfo_upd.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+    with pytest.raises(DBAPIError) as excinfo_del:
+        await db_session.execute(
+            text("DELETE FROM audit_logs WHERE tenant_id = :tid"),
+            {"tid": str(tenant_a)},
+        )
+    assert getattr(excinfo_del.value.orig, "sqlstate", None) == "42501"
     await db_session.rollback()
