@@ -1,13 +1,13 @@
 """Add user-scoped RLS policies for tenant_users and tenants to support membership resolution.
 
-Revision ID: 0003_user_scoped_membership_policies
+Revision ID: 0003_membership_rls_policies
 Revises: 0002_harden_rls_policies
 Create Date: 2026-11-14 13:00:00.000000
 """
 from typing import Sequence, Union
 from alembic import op
 
-revision: str = "0003_user_scoped_membership_policies"
+revision: str = "0003_membership_rls_policies"
 down_revision: Union[str, None] = "0002_harden_rls_policies"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
