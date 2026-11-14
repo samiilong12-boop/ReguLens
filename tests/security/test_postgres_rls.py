@@ -1402,7 +1402,7 @@ async def test_switch_tenant_rejects_client_supplied_role(
     req = SwitchTenantRequest(tenant_id=tenant_b_id)
     resp = await switch_active_tenant(request=req, current_user=auth_user, db=db_session)
 
-    assert resp.tenant_id == tenant_b_id
+    assert resp.active_tenant_id == tenant_b_id
     assert resp.role == "VIEWER"
 
     payload = decode_token(resp.access_token)
