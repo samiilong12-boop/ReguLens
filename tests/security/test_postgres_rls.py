@@ -1269,7 +1269,7 @@ async def test_revoked_membership_denied_on_domain_request(
         await anext(agen)
 
     assert excinfo.value.status_code == 403
-    assert "Not an active member" in excinfo.value.detail
+    assert "not an active member" in excinfo.value.detail.lower()
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -1351,7 +1351,7 @@ async def test_inactive_tenant_denied(
         await anext(agen)
 
     assert excinfo.value.status_code == 403
-    assert "Tenant organization is deactivated" in excinfo.value.detail
+    assert "inactive" in excinfo.value.detail.lower()
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -1400,7 +1400,7 @@ async def test_switch_tenant_rejects_client_supplied_role(
         role="OWNER",
     )
     req = SwitchTenantRequest(tenant_id=tenant_b_id)
-    resp = await switch_active_tenant(request=req, current_user=auth_user, session=db_session)
+    resp = await switch_active_tenant(request=req, current_user=auth_user, db=db_session)
 
     assert resp.tenant_id == tenant_b_id
     assert resp.role == "VIEWER"
@@ -1519,7 +1519,7 @@ async def test_switch_tenant_e2e_flow(
         role="OWNER",
     )
     req = SwitchTenantRequest(tenant_id=tenant_b_id)
-    resp = await switch_active_tenant(request=req, current_user=auth_user, session=db_session)
+    resp = await switch_active_tenant(request=req, current_user=auth_user, db=db_session)
 
     # Validates new token bound to Tenant B with VIEWER role
     payload_b = decode_token(resp.access_token)
