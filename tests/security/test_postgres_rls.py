@@ -1685,9 +1685,11 @@ async def fastapi_auth_test_client() -> AsyncGenerator[AsyncClient, None]:
     - Overrides only get_db (infrastructure database session provider) to bind to DATABASE_TEST_URL
       using ReguLensAppSession under unprivileged regulens_app role.
     """
-    from app.db.session import ReguLensAppSession, get_db
+    from app.api.deps import get_db as deps_get_db
+    from app.db.session import ReguLensAppSession
+    from app.db.session import get_db as session_get_db
 
-    test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
+    test_engine = create_async_engine(DATABASE_TEST_URL, poolclass=NullPool)
     test_session_maker = async_sessionmaker(
         test_engine,
         class_=AsyncSession,
@@ -1702,7 +1704,8 @@ async def fastapi_auth_test_client() -> AsyncGenerator[AsyncClient, None]:
             yield session
 
     test_app = FastAPI()
-    test_app.dependency_overrides[get_db] = override_get_db
+    test_app.dependency_overrides[deps_get_db] = override_get_db
+    test_app.dependency_overrides[session_get_db] = override_get_db
 
     @test_app.get("/api/v1/test/owner-protected")
     async def owner_protected_endpoint(
