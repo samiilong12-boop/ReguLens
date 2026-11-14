@@ -1,12 +1,13 @@
 """Database session management and transaction-local tenant context binding."""
 from uuid import UUID
 from typing import AsyncGenerator
+from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
     async_sessionmaker,
 )
-from sqlalchemy import text
+from sqlalchemy import event, text
 from app.core.config import settings
 
 # Async SQLAlchemy engine with connection pooling
@@ -18,9 +19,38 @@ engine = create_async_engine(
     max_overflow=20,
 )
 
+
+class ReguLensAppSession(Session):
+    """Dedicated SQLAlchemy sync session subclass for runtime application sessions only.
+    
+    Ensures transaction-level event listeners are strictly scoped to the application
+    runtime and are never inherited by administrative test or migration sessions.
+    """
+    pass
+
+
+@event.listens_for(ReguLensAppSession, "after_begin")
+def receive_after_begin(session: Session, transaction, connection) -> None:
+    """Re-arms the PostgreSQL transaction-local tenant context on each transaction.
+    
+    In PostgreSQL 16, transaction-local settings set with `is_local = true` are natively
+    cleared to '' (empty string) upon transaction COMMIT or ROLLBACK.
+    When a connection from the pool is reused for a subsequent transaction on the same
+    ReguLensAppSession, this listener automatically re-executes set_config if a verified
+    tenant_id is recorded in session.info.
+    """
+    tenant_id = session.info.get("tenant_id")
+    if tenant_id:
+        connection.execute(
+            text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
+        )
+
+
 async_session_maker = async_sessionmaker(
     engine,
     class_=AsyncSession,
+    sync_session_class=ReguLensAppSession,
     expire_on_commit=False,
     autocommit=False,
     autoflush=False,
@@ -41,7 +71,9 @@ async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
     
     Using the third argument `is_local = true` ensures the configuration is strictly
     scoped to the current database transaction and automatically cleared upon commit/rollback.
+    Also records tenant_id in session.sync_session.info for the application session lifecycle.
     """
+    session.sync_session.info["tenant_id"] = tenant_id
     await session.execute(
         text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
         {"tenant_id": str(tenant_id)},

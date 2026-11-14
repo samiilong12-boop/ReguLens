@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - master
+      - 'feature/**'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -52,15 +56,144 @@ jobs:
         working-directory: apps/api
         run: uv sync --extra dev
 
-      - name: Run Alembic schema migrations
+      - name: Run Alembic schema migrations (upgrade head)
         working-directory: apps/api
         env:
           DATABASE_MIGRATION_URL: "postgresql+asyncpg://regulens_migrator:CHANGE_MIGRATOR_PASSWORD_HERE@localhost:5432/regulens_dev"
         run: uv run alembic upgrade head
 
-      - name: Execute test suite (including 10 PostgreSQL RLS integration tests)
+      - name: Test Alembic migration downgrade and re-upgrade (0002 <-> 0001)
         working-directory: apps/api
         env:
+          DATABASE_MIGRATION_URL: "postgresql+asyncpg://regulens_migrator:CHANGE_MIGRATOR_PASSWORD_HERE@localhost:5432/regulens_dev"
+        run: |
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+
+      - name: Inject temporary unsafe privileges on audit_logs for idempotency testing
+        env:
+          PGPASSWORD: ci_temp_postgres_password
+        run: |
+          echo "Granting UPDATE, DELETE, TRUNCATE on audit_logs to regulens_app..."
+          psql -h localhost -p 5432 -U postgres -d regulens_dev -v ON_ERROR_STOP=1 -c "
+            GRANT UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs TO regulens_app;
+          "
+          echo "Verifying precondition: asserting unsafe privileges are actually present..."
+          psql -h localhost -p 5432 -U postgres -d regulens_dev -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT (
+                has_table_privilege('regulens_app', 'public.audit_logs', 'UPDATE') AND
+                has_table_privilege('regulens_app', 'public.audit_logs', 'DELETE') AND
+                has_table_privilege('regulens_app', 'public.audit_logs', 'TRUNCATE')
+              ) THEN
+                RAISE EXCEPTION 'Idempotency test precondition failed: unsafe privileges were not granted!';
+              END IF;
+              RAISE NOTICE 'Precondition verified: regulens_app has UPDATE, DELETE, TRUNCATE on audit_logs.';
+            END
+            \$\$;
+          "
+
+      - name: Re-execute database role provisioning (idempotency verification)
+        env:
+          PGPASSWORD: ci_temp_postgres_password
+        run: |
+          psql -h localhost -p 5432 -U postgres -d postgres -f scripts/init_db_roles.sql
+
+      - name: Execute complete test suite (unit, integration, and PostgreSQL RLS tests)
+        working-directory: apps/api
+        env:
+          CI: "true"
           DATABASE_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
           DATABASE_TEST_URL: "postgresql+asyncpg://regulens_app:CHANGE_APP_PASSWORD_HERE@localhost:5432/regulens_dev"
-        run: uv run pytest -v
+          DATABASE_ADMIN_TEST_URL: "postgresql+asyncpg://postgres:ci_temp_postgres_password@localhost:5432/regulens_dev"
+        run: uv run pytest -c pyproject.toml -v -rs --junit-xml=test-results.xml
+
+      - name: Verify test results and zero skipped RLS tests in CI
+        if: always()
+        working-directory: apps/api
+        run: |
+          python -c "
+          import xml.etree.ElementTree as ET
+          import os, sys
+
+          report_file = 'test-results.xml'
+          if not os.path.exists(report_file):
+              print('CI Security Violation: JUnit XML report not found!', file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              tree = ET.parse(report_file)
+              root = tree.getroot()
+          except Exception as e:
+              print(f'CI Security Violation: Failed to parse JUnit XML: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          all_testcases = root.findall('.//testcase')
+          if not all_testcases:
+              print('CI Security Violation: No testcases found in JUnit XML!', file=sys.stderr)
+              sys.exit(1)
+
+          total_tests = 0
+          total_failures = 0
+          total_errors = 0
+          total_skipped = 0
+          rls_tests_found = 0
+          rls_skipped = 0
+
+          for tc in all_testcases:
+              total_tests += 1
+              classname = tc.attrib.get('classname', '')
+              name = tc.attrib.get('name', '')
+              file_attr = tc.attrib.get('file', '')
+              is_rls = 'test_postgres_rls' in classname or 'test_postgres_rls' in name or 'test_postgres_rls' in file_attr
+
+              has_failure = tc.find('failure') is not None
+              has_error = tc.find('error') is not None
+              has_skipped = tc.find('skipped') is not None
+
+              if has_failure:
+                  total_failures += 1
+              if has_error:
+                  total_errors += 1
+              if has_skipped:
+                  total_skipped += 1
+                  if is_rls:
+                      rls_skipped += 1
+
+              if is_rls:
+                  rls_tests_found += 1
+
+          print('=== CI Test Quality Gate Summary ===')
+          print(f'Total Executed Tests : {total_tests}')
+          print(f'RLS Security Tests   : {rls_tests_found}')
+          print(f'Total Failures       : {total_failures}')
+          print(f'Total Errors         : {total_errors}')
+          print(f'Total Skipped        : {total_skipped}')
+          print(f'RLS Skipped          : {rls_skipped}')
+
+          min_total_tests = 58
+          min_rls_tests = 17
+
+          if total_tests < min_total_tests:
+              print(f'CI Quality Gate Violation: Executed total tests ({total_tests}) below required minimum ({min_total_tests})!', file=sys.stderr)
+              sys.exit(1)
+
+          if rls_tests_found < min_rls_tests:
+              print(f'CI Quality Gate Violation: Executed RLS security tests ({rls_tests_found}) below required minimum ({min_rls_tests})!', file=sys.stderr)
+              sys.exit(1)
+
+          if rls_skipped > 0:
+              print(f'CI Security Violation: {rls_skipped} RLS integration test(s) were skipped!', file=sys.stderr)
+              sys.exit(1)
+
+          if total_skipped > 0:
+              print(f'CI Quality Gate Violation: {total_skipped} test(s) were skipped in CI!', file=sys.stderr)
+              sys.exit(1)
+
+          if total_failures > 0 or total_errors > 0:
+              print(f'CI Test Failure: {total_failures} failure(s) and {total_errors} error(s) detected.', file=sys.stderr)
+              sys.exit(1)
+
+          print(f'Quality Gate Passed: All {total_tests} tests executed ({rls_tests_found} RLS tests), 0 skipped, 0 failures.')
+          "
