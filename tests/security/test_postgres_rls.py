@@ -1881,19 +1881,19 @@ async def test_fastapi_revoked_membership_denied_403(
 ):
     """FastAPI Integration: Token denied with HTTP 403 when membership is revoked in DB."""
     ctx = provisioned_multi_tenant_users
-    user_3_id = ctx["user_3_id"]
-    tenant_a_id = ctx["tenant_a_id"]
+    user_2_id = ctx["user_2_id"]
+    tenant_c_id = ctx["tenant_c_id"]
 
-    # 1. Revoke membership in database
+    # 1. Revoke membership in database for an active user
     await admin_session.execute(
         text("DELETE FROM tenant_users WHERE id = :id"),
-        {"id": str(ctx["m_3_a_id"])},
+        {"id": str(ctx["m_2_c_id"])},
     )
     await admin_session.commit()
 
     # 2. Present valid token for revoked membership
     token = create_access_token(
-        data={"sub": str(user_3_id), "tenant_id": str(tenant_a_id), "role": "VIEWER"}
+        data={"sub": str(user_2_id), "tenant_id": str(tenant_c_id), "role": "ADMIN"}
     )
     resp = await fastapi_auth_test_client.get(
         "/api/v1/test/owner-protected",
