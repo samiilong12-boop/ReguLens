@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
 )
-from sqlalchemy import text
+from sqlalchemy import event, text
 from app.core.config import settings
 
 # Async SQLAlchemy engine with connection pooling
@@ -27,6 +27,24 @@ class ReguLensAppSession(Session):
     runtime and are never inherited by administrative test or migration sessions.
     """
     pass
+
+
+@event.listens_for(ReguLensAppSession, "after_begin")
+def receive_after_begin(session: Session, transaction, connection) -> None:
+    """Re-arms the PostgreSQL transaction-local tenant context on each transaction.
+    
+    In PostgreSQL 16, transaction-local settings set with `is_local = true` are natively
+    cleared to '' (empty string) upon transaction COMMIT or ROLLBACK.
+    When a connection from the pool is reused for a subsequent transaction on the same
+    ReguLensAppSession, this listener automatically re-executes set_config if a verified
+    tenant_id is recorded in session.info.
+    """
+    tenant_id = session.info.get("tenant_id")
+    if tenant_id:
+        connection.execute(
+            text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
+        )
 
 
 async_session_maker = async_sessionmaker(

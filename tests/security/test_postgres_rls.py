@@ -236,6 +236,7 @@ async def test_own_tenant_crud_positive_control(
     await db_session.commit()
 
     # 4. Update own Product
+    await db_session.execute(text("SELECT set_config('app.current_tenant_id', :id, true)"), {"id": str(tenant_a)})
     update_res = await db_session.execute(
         text("UPDATE products SET name = 'Tenant A Clementines' WHERE id = :id"),
         {"id": str(prod_a2_id)},
@@ -353,6 +354,9 @@ async def test_audit_logs_immutability_enforced_by_privilege(
     db_session.add(log)
     await db_session.commit()
 
+    # Re-arm Tenant A context so RLS permits the statement and execution reaches SQL table privilege check
+    await db_session.execute(text("SELECT set_config('app.current_tenant_id', :id, true)"), {"id": str(tenant_a)})
+
     # Attempt UPDATE -> Must fail with SQLSTATE 42501
     with pytest.raises(DBAPIError) as excinfo_update:
         await db_session.execute(
@@ -366,6 +370,9 @@ async def test_audit_logs_immutability_enforced_by_privilege(
     sqlstate_upd = getattr(orig_upd, "sqlstate", None) or getattr(orig_upd, "pgcode", None)
     assert sqlstate_upd == "42501", f"Expected SQLSTATE 42501 on UPDATE, got {sqlstate_upd}"
     assert "permission denied for table audit_logs" in str(orig_upd).lower()
+
+    # Re-arm Tenant A context for DELETE
+    await db_session.execute(text("SELECT set_config('app.current_tenant_id', :id, true)"), {"id": str(tenant_a)})
 
     # Attempt DELETE -> Must fail with SQLSTATE 42501
     with pytest.raises(DBAPIError) as excinfo_del:
@@ -490,3 +497,26 @@ async def test_real_application_path_post_commit_integration(
         assert count_res.scalar() == 1, "Tenant A saw unexpected number of products."
 
         await session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSession):
+    """Catalog Test: Verifies that every RLS policy using app.current_tenant_id contains NULLIF."""
+    query = text("""
+        SELECT tablename, policyname, cmd, qual, with_check
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND (qual LIKE '%app.current_tenant_id%' OR with_check LIKE '%app.current_tenant_id%');
+    """)
+    res = await admin_session.execute(query)
+    policies = res.all()
+    assert len(policies) == 13, f"Expected exactly 13 policies using app.current_tenant_id, found {len(policies)}"
+    for tablename, policyname, cmd, qual, with_check in policies:
+        if qual and "app.current_tenant_id" in qual:
+            assert "nullif" in qual.lower(), (
+                f"Policy '{policyname}' on table '{tablename}' (qual) does not contain NULLIF: {qual}"
+            )
+        if with_check and "app.current_tenant_id" in with_check:
+            assert "nullif" in with_check.lower(), (
+                f"Policy '{policyname}' on table '{tablename}' (with_check) does not contain NULLIF: {with_check}"
+            )
