@@ -31,15 +31,21 @@ class ReguLensAppSession(Session):
 
 @event.listens_for(ReguLensAppSession, "after_begin")
 def receive_after_begin(session: Session, transaction, connection) -> None:
-    """Re-arms the PostgreSQL transaction-local tenant context on each transaction.
+    """Re-arms the PostgreSQL transaction-local tenant and user context on each transaction.
     
     In PostgreSQL 16, transaction-local settings set with `is_local = true` are natively
     cleared to '' (empty string) upon transaction COMMIT or ROLLBACK.
     When a connection from the pool is reused for a subsequent transaction on the same
-    ReguLensAppSession, this listener automatically re-executes set_config if a verified
-    tenant_id is recorded in session.info.
+    ReguLensAppSession, this listener automatically re-executes set_config if verified
+    user_id or tenant_id values are recorded in session.info.
     """
+    user_id = session.info.get("user_id")
     tenant_id = session.info.get("tenant_id")
+    if user_id:
+        connection.execute(
+            text("SELECT set_config('app.current_user_id', :user_id, true)"),
+            {"user_id": str(user_id)},
+        )
     if tenant_id:
         connection.execute(
             text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
@@ -66,6 +72,26 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+async def set_user_context(session: AsyncSession, user_id: UUID) -> None:
+    """Sets the PostgreSQL transaction-local session variable for user-scoped Row Level Security.
+    
+    Using the third argument `is_local = true` ensures the configuration is strictly
+    scoped to the current database transaction and automatically cleared upon commit/rollback.
+    Also records user_id in session.sync_session.info for the application session lifecycle.
+    """
+    if not isinstance(user_id, UUID):
+        try:
+            user_id = UUID(str(user_id))
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid user_id format; must be a valid UUID: {user_id}")
+
+    session.sync_session.info["user_id"] = user_id
+    await session.execute(
+        text("SELECT set_config('app.current_user_id', :user_id, true)"),
+        {"user_id": str(user_id)},
+    )
+
+
 async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
     """Sets the PostgreSQL transaction-local session variable for Row Level Security.
     
@@ -73,6 +99,12 @@ async def set_tenant_context(session: AsyncSession, tenant_id: UUID) -> None:
     scoped to the current database transaction and automatically cleared upon commit/rollback.
     Also records tenant_id in session.sync_session.info for the application session lifecycle.
     """
+    if not isinstance(tenant_id, UUID):
+        try:
+            tenant_id = UUID(str(tenant_id))
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid tenant_id format; must be a valid UUID: {tenant_id}")
+
     session.sync_session.info["tenant_id"] = tenant_id
     await session.execute(
         text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),

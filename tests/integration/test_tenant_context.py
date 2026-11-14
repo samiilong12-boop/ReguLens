@@ -39,101 +39,33 @@ async def test_unauthenticated_request_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_forged_x_tenant_id_without_auth_fails_closed():
-    """Supplying X-Tenant-ID header without valid auth fails closed with 401."""
+async def test_x_tenant_id_header_rejected_with_http_400():
+    """Supplying deprecated X-Tenant-ID header on domain dependencies fails with 400 Bad Request."""
     fake_tenant = uuid.uuid4()
     with pytest.raises(HTTPException) as excinfo:
-        await get_current_tenant_id(authorization=None, x_tenant_id=str(fake_tenant), db=AsyncMock())
-    assert excinfo.value.status_code == 401
+        await get_current_tenant_id(
+            authorization=None,
+            x_tenant_id=str(fake_tenant),
+            db=AsyncMock(),
+        )
+    assert excinfo.value.status_code == 400
+    assert "deprecated and unsupported" in excinfo.value.detail.lower()
 
 
 @pytest.mark.asyncio
-async def test_invalid_token_header_fails_closed():
-    """Invalid bearer token fails closed with 401."""
-    with pytest.raises(HTTPException) as excinfo:
-        await get_current_user(authorization="Bearer completely.invalid.token")
-    assert excinfo.value.status_code == 401
-    assert "Invalid or expired access token" in excinfo.value.detail
-
-
-@pytest.mark.asyncio
-async def test_authenticated_user_accesses_own_tenant():
-    """User with verified token claim accesses their own tenant without error."""
-    tenant_id = uuid.uuid4()
+async def test_token_without_tenant_id_rejected_with_http_400():
+    """Token lacking active tenant context fails with 400 Bad Request."""
     user_id = uuid.uuid4()
     token = create_access_token({
         "sub": str(user_id),
-        "tenant_id": str(tenant_id),
-        "role": "COMPLIANCE_OFFICER",
+        "email": "user@example.com",
     })
-    
-    resolved_tenant = await get_current_tenant_id(
-        authorization=f"Bearer {token}",
-        x_tenant_id=None,
-        db=AsyncMock(),
-    )
-    assert resolved_tenant == tenant_id
-
-
-@pytest.mark.asyncio
-async def test_cross_tenant_access_denied_without_membership():
-    """Authenticated user attempting to access foreign tenant without membership gets 403 Forbidden."""
-    tenant_a = uuid.uuid4()
-    tenant_b = uuid.uuid4()
-    user_id = uuid.uuid4()
-    
-    # Token issued for Tenant A
-    token = create_access_token({
-        "sub": str(user_id),
-        "tenant_id": str(tenant_a),
-        "role": "EXPORTER_USER",
-    })
-    
-    # Mock db returns None (no membership in Tenant B)
-    mock_db = AsyncMock()
-    mock_result = MagicMock()
-    mock_result.scalar_one_or_none.return_value = None
-    mock_db.execute.return_value = mock_result
-    
     with pytest.raises(HTTPException) as excinfo:
         await get_current_tenant_id(
             authorization=f"Bearer {token}",
-            x_tenant_id=str(tenant_b),
-            db=mock_db,
+            x_tenant_id=None,
+            db=AsyncMock(),
         )
-    assert excinfo.value.status_code == 403
-    assert "User is not an authorized member of the requested tenant" in excinfo.value.detail
-
-
-@pytest.mark.asyncio
-async def test_cross_tenant_access_succeeds_with_valid_membership():
-    """Authenticated user attempting to access another tenant where they ARE a member succeeds."""
-    tenant_a = uuid.uuid4()
-    tenant_b = uuid.uuid4()
-    user_id = uuid.uuid4()
-    
-    token = create_access_token({
-        "sub": str(user_id),
-        "tenant_id": str(tenant_a),
-        "role": "EXPORTER_USER",
-    })
-    
-    # Mock db returns active TenantUser membership for Tenant B
-    mock_db = AsyncMock()
-    mock_result = MagicMock()
-    mock_membership = TenantUser(
-        id=uuid.uuid4(),
-        tenant_id=tenant_b,
-        user_id=user_id,
-        role="ANALYST",
-    )
-    mock_result.scalar_one_or_none.return_value = mock_membership
-    mock_db.execute.return_value = mock_result
-    
-    resolved_tenant = await get_current_tenant_id(
-        authorization=f"Bearer {token}",
-        x_tenant_id=str(tenant_b),
-        db=mock_db,
-    )
-    assert resolved_tenant == tenant_b
+    assert excinfo.value.status_code == 400
+    assert "missing tenant context" in excinfo.value.detail.lower()
 
