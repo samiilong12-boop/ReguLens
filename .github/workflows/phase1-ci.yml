@@ -62,7 +62,7 @@ jobs:
           DATABASE_MIGRATION_URL: "postgresql+asyncpg://regulens_migrator:CHANGE_MIGRATOR_PASSWORD_HERE@localhost:5432/regulens_dev"
         run: uv run alembic upgrade head
 
-      - name: Test Alembic migration downgrade and re-upgrade (0002 <-> 0001)
+      - name: Test Alembic migration downgrade and re-upgrade (0003 <-> 0002)
         working-directory: apps/api
         env:
           DATABASE_MIGRATION_URL: "postgresql+asyncpg://regulens_migrator:CHANGE_MIGRATOR_PASSWORD_HERE@localhost:5432/regulens_dev"
@@ -172,8 +172,8 @@ jobs:
           print(f'Total Skipped        : {total_skipped}')
           print(f'RLS Skipped          : {rls_skipped}')
 
-          min_total_tests = 58
-          min_rls_tests = 17
+          min_total_tests = 71
+          min_rls_tests = 33
 
           if total_tests < min_total_tests:
               print(f'CI Quality Gate Violation: Executed total tests ({total_tests}) below required minimum ({min_total_tests})!', file=sys.stderr)

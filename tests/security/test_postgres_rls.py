@@ -23,10 +23,13 @@ In accordance with AGENTS.md Rule 7, QUALITY_GATES.md, and Phase 1 Package A:
 import os
 import socket
 import uuid
+from datetime import timedelta
 from typing import AsyncGenerator, Tuple
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
+from jose import jwt
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
@@ -37,6 +40,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.security import create_access_token, decode_token
 from app.db.models import (
     AuditLog,
     BackgroundJob,
@@ -44,8 +48,16 @@ from app.db.models import (
     Document,
     Product,
     Tenant,
+    TenantUser,
+    User,
 )
-from app.db.session import ReguLensAppSession, async_session_maker, set_tenant_context
+from app.db.session import (
+    ReguLensAppSession,
+    async_session_maker,
+    set_tenant_context,
+    set_user_context,
+)
+from app.api.deps import CurrentUser, get_tenant_db
 
 DATABASE_TEST_URL = os.getenv("DATABASE_TEST_URL", settings.DATABASE_URL)
 DATABASE_ADMIN_TEST_URL = os.getenv("DATABASE_ADMIN_TEST_URL")
@@ -645,22 +657,43 @@ async def test_real_application_path_post_commit_integration(
 
 @pytest.mark.asyncio(loop_scope="function")
 async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSession):
-    """Catalog Test: Verifies that every RLS policy using app.current_tenant_id contains NULLIF."""
-    query = text("""
+    """Catalog Test: Verifies that every RLS policy using app.current_tenant_id or app.current_user_id contains NULLIF."""
+    # 1. Policies using app.current_tenant_id (13 policies across 12 tables)
+    query_tenant = text("""
         SELECT tablename, policyname, cmd, qual, with_check
         FROM pg_policies
         WHERE schemaname = 'public'
           AND (qual LIKE '%app.current_tenant_id%' OR with_check LIKE '%app.current_tenant_id%');
     """)
-    res = await admin_session.execute(query)
-    policies = res.all()
-    assert len(policies) == 13, f"Expected exactly 13 policies using app.current_tenant_id, found {len(policies)}"
-    for tablename, policyname, cmd, qual, with_check in policies:
+    res_tenant = await admin_session.execute(query_tenant)
+    policies_tenant = res_tenant.all()
+    assert len(policies_tenant) == 13, f"Expected exactly 13 policies using app.current_tenant_id, found {len(policies_tenant)}"
+    for tablename, policyname, cmd, qual, with_check in policies_tenant:
         if qual and "app.current_tenant_id" in qual:
             assert "nullif" in qual.lower(), (
                 f"Policy '{policyname}' on table '{tablename}' (qual) does not contain NULLIF: {qual}"
             )
         if with_check and "app.current_tenant_id" in with_check:
+            assert "nullif" in with_check.lower(), (
+                f"Policy '{policyname}' on table '{tablename}' (with_check) does not contain NULLIF: {with_check}"
+            )
+
+    # 2. Policies using app.current_user_id (2 policies on tenant_users and tenants introduced in Migration 0003)
+    query_user = text("""
+        SELECT tablename, policyname, cmd, qual, with_check
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND (qual LIKE '%app.current_user_id%' OR with_check LIKE '%app.current_user_id%');
+    """)
+    res_user = await admin_session.execute(query_user)
+    policies_user = res_user.all()
+    assert len(policies_user) == 2, f"Expected exactly 2 policies using app.current_user_id, found {len(policies_user)}"
+    for tablename, policyname, cmd, qual, with_check in policies_user:
+        if qual and "app.current_user_id" in qual:
+            assert "nullif" in qual.lower(), (
+                f"Policy '{policyname}' on table '{tablename}' (qual) does not contain NULLIF: {qual}"
+            )
+        if with_check and "app.current_user_id" in with_check:
             assert "nullif" in with_check.lower(), (
                 f"Policy '{policyname}' on table '{tablename}' (with_check) does not contain NULLIF: {with_check}"
             )
@@ -944,3 +977,557 @@ async def test_init_db_roles_idempotency_audit_logs_privileges(
         )
     assert getattr(excinfo_del.value.orig, "sqlstate", None) == "42501"
     await db_session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Package B: Token-Bound Multi-Tenant Authorization and Tenant Switching Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def provisioned_multi_tenant_users(
+    admin_session: AsyncSession,
+) -> AsyncGenerator[dict, None]:
+    """Provisions a realistic multi-tenant hierarchy for Package B testing:
+    - User 1: Active. Member of Tenant A (Role: OWNER), Tenant B (Role: VIEWER), Tenant D (Role: VIEWER).
+    - User 2: Active. Member of Tenant B (Role: COMPLIANCE_OFFICER), Tenant C (Role: ADMIN).
+    - User 3: Deactivated (is_active = False). Member of Tenant A (Role: VIEWER).
+    - Tenant A: Active.
+    - Tenant B: Active.
+    - Tenant C: Active (User 1 is not a member).
+    - Tenant D: Inactive (is_active = False, User 1 is a member).
+    """
+    user_1_id = uuid.uuid4()
+    user_2_id = uuid.uuid4()
+    user_3_id = uuid.uuid4()
+
+    tenant_a_id = uuid.uuid4()
+    tenant_b_id = uuid.uuid4()
+    tenant_c_id = uuid.uuid4()
+    tenant_d_id = uuid.uuid4()
+
+    u1 = User(
+        id=user_1_id,
+        email=f"u1_{user_1_id.hex[:6]}@example.com",
+        password_hash="fakehash_u1",
+        full_name="User One",
+        is_active=True,
+    )
+    u2 = User(
+        id=user_2_id,
+        email=f"u2_{user_2_id.hex[:6]}@example.com",
+        password_hash="fakehash_u2",
+        full_name="User Two",
+        is_active=True,
+    )
+    u3 = User(
+        id=user_3_id,
+        email=f"u3_{user_3_id.hex[:6]}@example.com",
+        password_hash="fakehash_u3",
+        full_name="User Three Deactivated",
+        is_active=False,
+    )
+
+    t_a = Tenant(id=tenant_a_id, name=f"Tenant A {tenant_a_id.hex[:6]}", country="EG", is_active=True)
+    t_b = Tenant(id=tenant_b_id, name=f"Tenant B {tenant_b_id.hex[:6]}", country="EG", is_active=True)
+    t_c = Tenant(id=tenant_c_id, name=f"Tenant C {tenant_c_id.hex[:6]}", country="EG", is_active=True)
+    t_d = Tenant(id=tenant_d_id, name=f"Tenant D {tenant_d_id.hex[:6]}", country="EG", is_active=False)
+
+    admin_session.add_all([u1, u2, u3, t_a, t_b, t_c, t_d])
+    await admin_session.flush()
+
+    m_1_a_id = uuid.uuid4()
+    m_1_b_id = uuid.uuid4()
+    m_1_d_id = uuid.uuid4()
+    m_2_b_id = uuid.uuid4()
+    m_2_c_id = uuid.uuid4()
+    m_3_a_id = uuid.uuid4()
+
+    m_1_a = TenantUser(id=m_1_a_id, tenant_id=tenant_a_id, user_id=user_1_id, role="OWNER")
+    m_1_b = TenantUser(id=m_1_b_id, tenant_id=tenant_b_id, user_id=user_1_id, role="VIEWER")
+    m_1_d = TenantUser(id=m_1_d_id, tenant_id=tenant_d_id, user_id=user_1_id, role="VIEWER")
+    m_2_b = TenantUser(id=m_2_b_id, tenant_id=tenant_b_id, user_id=user_2_id, role="COMPLIANCE_OFFICER")
+    m_2_c = TenantUser(id=m_2_c_id, tenant_id=tenant_c_id, user_id=user_2_id, role="ADMIN")
+    m_3_a = TenantUser(id=m_3_a_id, tenant_id=tenant_a_id, user_id=user_3_id, role="VIEWER")
+
+    admin_session.add_all([m_1_a, m_1_b, m_1_d, m_2_b, m_2_c, m_3_a])
+    await admin_session.commit()
+
+    context = {
+        "user_1_id": user_1_id,
+        "user_2_id": user_2_id,
+        "user_3_id": user_3_id,
+        "tenant_a_id": tenant_a_id,
+        "tenant_b_id": tenant_b_id,
+        "tenant_c_id": tenant_c_id,
+        "tenant_d_id": tenant_d_id,
+        "m_1_a_id": m_1_a_id,
+        "m_1_b_id": m_1_b_id,
+        "m_1_d_id": m_1_d_id,
+        "m_2_b_id": m_2_b_id,
+        "m_2_c_id": m_2_c_id,
+        "m_3_a_id": m_3_a_id,
+    }
+
+    try:
+        yield context
+    finally:
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(
+                text("DELETE FROM tenant_users WHERE user_id IN (:u1, :u2, :u3)"),
+                {"u1": str(user_1_id), "u2": str(user_2_id), "u3": str(user_3_id)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM tenants WHERE id IN (:ta, :tb, :tc, :td)"),
+                {"ta": str(tenant_a_id), "tb": str(tenant_b_id), "tc": str(tenant_c_id), "td": str(tenant_d_id)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM users WHERE id IN (:u1, :u2, :u3)"),
+                {"u1": str(user_1_id), "u2": str(user_2_id), "u3": str(user_3_id)},
+            )
+            await admin_session.commit()
+        except Exception:
+            await admin_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_user_scoped_membership_visibility(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 1: Under unprivileged role with only user_id context, user sees all their memberships."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    await set_user_context(db_session, user_1_id)
+
+    res = await db_session.execute(select(TenantUser))
+    memberships = res.scalars().all()
+    membership_ids = {m.id for m in memberships}
+
+    assert ctx["m_1_a_id"] in membership_ids
+    assert ctx["m_1_b_id"] in membership_ids
+    assert ctx["m_1_d_id"] in membership_ids
+    assert ctx["m_2_b_id"] not in membership_ids
+    assert ctx["m_2_c_id"] not in membership_ids
+    assert ctx["m_3_a_id"] not in membership_ids
+    assert len(memberships) == 3
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cross_user_membership_isolation(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 2: Cross-user membership isolation denies reads, updates, deletes, and unauthorized inserts."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    user_2_id = ctx["user_2_id"]
+    await set_user_context(db_session, user_1_id)
+
+    # 1. Read User 2 membership returns None
+    res = await db_session.execute(select(TenantUser).where(TenantUser.id == ctx["m_2_b_id"]))
+    assert res.scalar_one_or_none() is None
+
+    # 2. Update User 2 membership affects 0 rows
+    upd = await db_session.execute(
+        text("UPDATE tenant_users SET role = 'ATTACKER' WHERE id = :id"),
+        {"id": str(ctx["m_2_b_id"])},
+    )
+    assert upd.rowcount == 0
+
+    # 3. Delete User 2 membership affects 0 rows
+    dlt = await db_session.execute(
+        text("DELETE FROM tenant_users WHERE id = :id"),
+        {"id": str(ctx["m_2_b_id"])},
+    )
+    assert dlt.rowcount == 0
+
+    # 4. Insert membership for User 2 fails RLS WITH CHECK (SQLSTATE 42501)
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            text("""
+                INSERT INTO tenant_users (id, tenant_id, user_id, role)
+                VALUES (:id, :tid, :uid, 'VIEWER')
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "tid": str(ctx["tenant_a_id"]),
+                "uid": str(user_2_id),
+            },
+        )
+    assert getattr(excinfo.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_tenants_metadata_discovery_under_user_guc(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 3: Under only user context, user can discover only tenants they belong to."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    await set_user_context(db_session, user_1_id)
+
+    res = await db_session.execute(select(Tenant))
+    tenants = res.scalars().all()
+    tenant_ids = {t.id for t in tenants}
+
+    assert ctx["tenant_a_id"] in tenant_ids
+    assert ctx["tenant_b_id"] in tenant_ids
+    assert ctx["tenant_d_id"] in tenant_ids
+    # User 1 is NOT a member of Tenant C -> Tenant C is not visible
+    assert ctx["tenant_c_id"] not in tenant_ids
+
+    # Direct query for Tenant C returns None
+    res_c = await db_session.execute(select(Tenant).where(Tenant.id == ctx["tenant_c_id"]))
+    assert res_c.scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_empty_gucs_fail_closed(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 4: When neither user_id nor tenant_id is set, tenant_users and tenants return 0 rows."""
+    await db_session.execute(text("SELECT set_config('app.current_user_id', '', true)"))
+    await db_session.execute(text("SELECT set_config('app.current_tenant_id', '', true)"))
+
+    res_users = await db_session.execute(select(TenantUser))
+    assert len(res_users.scalars().all()) == 0
+
+    res_tenants = await db_session.execute(select(Tenant))
+    assert len(res_tenants.scalars().all()) == 0
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_incorrect_user_guc_returns_zero_rows(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 5: A non-existent user UUID returns zero rows for memberships and tenants."""
+    random_user_id = uuid.uuid4()
+    await set_user_context(db_session, random_user_id)
+
+    res_users = await db_session.execute(select(TenantUser))
+    assert len(res_users.scalars().all()) == 0
+
+    res_tenants = await db_session.execute(select(Tenant))
+    assert len(res_tenants.scalars().all()) == 0
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_nested_tenants_tenant_users_rls_no_recursion(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 6: Joining tenants and tenant_users executes cleanly without infinite RLS recursion."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    await set_user_context(db_session, user_1_id)
+
+    stmt = (
+        select(Tenant.name, TenantUser.role)
+        .join(TenantUser, Tenant.id == TenantUser.tenant_id)
+        .order_by(Tenant.name)
+    )
+    res = await db_session.execute(stmt)
+    rows = res.all()
+    # User 1 has memberships in Tenant A, Tenant B, Tenant D
+    assert len(rows) == 3
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_revoked_membership_denied_on_domain_request(
+    admin_session: AsyncSession,
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 7: Revoked membership immediately denies domain request with HTTP 403."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]
+
+    # 1. Revoke membership by deleting the TenantUser record via admin
+    await admin_session.execute(
+        text("DELETE FROM tenant_users WHERE id = :id"),
+        {"id": str(ctx["m_1_b_id"])},
+    )
+    await admin_session.commit()
+
+    # 2. Simulate client presenting valid JWT for Tenant B to get_tenant_db
+    auth_user = CurrentUser(
+        id=user_1_id,
+        email="u1@example.com",
+        tenant_id=tenant_b_id,
+        role="VIEWER",
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        await anext(agen)
+
+    assert excinfo.value.status_code == 403
+    assert "Not an active member" in excinfo.value.detail
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_role_demotion_reflected_live(
+    admin_session: AsyncSession,
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 8: Role demotion in database is reflected live on next request."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    # Demote user from OWNER to VIEWER in database
+    await admin_session.execute(
+        text("UPDATE tenant_users SET role = 'VIEWER' WHERE id = :id"),
+        {"id": str(ctx["m_1_a_id"])},
+    )
+    await admin_session.commit()
+
+    # User presents token that still claims "OWNER"
+    auth_user = CurrentUser(
+        id=user_1_id,
+        email="u1@example.com",
+        tenant_id=tenant_a_id,
+        role="OWNER",
+    )
+    agen = get_tenant_db(current_user=auth_user, session=db_session)
+    yielded_session = await anext(agen)
+    assert yielded_session is not None
+    # Live database check must have updated in-memory role to VIEWER
+    assert auth_user.role == "VIEWER"
+    await agen.aclose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_inactive_user_denied(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 9: Deactivated user account is rejected immediately with HTTP 401."""
+    ctx = provisioned_multi_tenant_users
+    user_3_id = ctx["user_3_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    auth_user = CurrentUser(
+        id=user_3_id,
+        email="u3@example.com",
+        tenant_id=tenant_a_id,
+        role="VIEWER",
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        await anext(agen)
+
+    assert excinfo.value.status_code == 401
+    assert "deactivated" in excinfo.value.detail.lower()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_inactive_tenant_denied(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 10: Deactivated tenant organization is rejected immediately with HTTP 403."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_d_id = ctx["tenant_d_id"]  # Tenant D is deactivated
+
+    auth_user = CurrentUser(
+        id=user_1_id,
+        email="u1@example.com",
+        tenant_id=tenant_d_id,
+        role="VIEWER",
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        await anext(agen)
+
+    assert excinfo.value.status_code == 403
+    assert "Tenant organization is deactivated" in excinfo.value.detail
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_expired_and_forged_jwts_rejected(
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 11: Expired and forged signature JWTs fail decode and authentication."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    # 1. Expired token
+    expired_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"},
+        expires_delta=timedelta(seconds=-10),
+    )
+    assert decode_token(expired_token) is None
+
+    # 2. Forged signature token
+    forged_token = jwt.encode(
+        {"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"},
+        "WRONG_SECRET_KEY_FORGERY_TEST_1234567890",
+        algorithm="HS256",
+    )
+    assert decode_token(forged_token) is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_switch_tenant_rejects_client_supplied_role(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 12: Switch tenant derives role strictly from database, ignoring client claims."""
+    from app.api.v1.endpoints.auth import switch_tenant
+    from app.schemas.auth import SwitchTenantRequest
+
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # User 1 is VIEWER in Tenant B
+
+    # Authenticated user is currently in Tenant A as OWNER
+    auth_user = CurrentUser(
+        id=user_1_id,
+        email="u1@example.com",
+        tenant_id=ctx["tenant_a_id"],
+        role="OWNER",
+    )
+    req = SwitchTenantRequest(tenant_id=tenant_b_id)
+    resp = await switch_tenant(request=req, current_user=auth_user, session=db_session)
+
+    assert resp.tenant_id == tenant_b_id
+    assert resp.role == "VIEWER"
+
+    payload = decode_token(resp.access_token)
+    assert payload is not None
+    assert payload["tenant_id"] == str(tenant_b_id)
+    assert payload["role"] == "VIEWER"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_commit_and_rollback_clear_dual_gucs(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 13: Transaction commit and rollback natively clear both transaction-local GUCs."""
+    ctx = provisioned_multi_tenant_users
+    u_id = ctx["user_1_id"]
+    t_id = ctx["tenant_a_id"]
+
+    # 1. Within transaction: set both GUCs
+    await set_user_context(db_session, u_id)
+    await set_tenant_context(db_session, t_id)
+
+    u_setting = (await db_session.execute(text("SELECT current_setting('app.current_user_id', true)"))).scalar()
+    t_setting = (await db_session.execute(text("SELECT current_setting('app.current_tenant_id', true)"))).scalar()
+    assert u_setting == str(u_id)
+    assert t_setting == str(t_id)
+
+    # 2. Commit transaction -> transaction-local settings cleared to ''
+    await db_session.commit()
+    u_after_commit = (await db_session.execute(text("SELECT current_setting('app.current_user_id', true)"))).scalar()
+    t_after_commit = (await db_session.execute(text("SELECT current_setting('app.current_tenant_id', true)"))).scalar()
+    assert u_after_commit == ""
+    assert t_after_commit == ""
+
+    # 3. Repeat for rollback
+    await set_user_context(db_session, u_id)
+    await set_tenant_context(db_session, t_id)
+    await db_session.rollback()
+    u_after_rollback = (await db_session.execute(text("SELECT current_setting('app.current_user_id', true)"))).scalar()
+    t_after_rollback = (await db_session.execute(text("SELECT current_setting('app.current_tenant_id', true)"))).scalar()
+    assert u_after_rollback == ""
+    assert t_after_rollback == ""
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_connection_reuse_with_another_tenant_cleans_context(
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 14: ReguLensAppSession re-arms context per transaction and overwrites cleanly."""
+    ctx = provisioned_multi_tenant_users
+    u1 = ctx["user_1_id"]
+    ta = ctx["tenant_a_id"]
+    u2 = ctx["user_2_id"]
+    tb = ctx["tenant_b_id"]
+
+    test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
+    session_factory = async_sessionmaker(test_engine, class_=ReguLensAppSession, expire_on_commit=False)
+
+    async with session_factory() as session:
+        # First request context
+        await set_user_context(session, u1)
+        await set_tenant_context(session, ta)
+        await session.commit()
+
+        # Listener re-arms u1 and ta on next transaction
+        curr_t = (await session.execute(text("SELECT current_setting('app.current_tenant_id', true)"))).scalar()
+        assert curr_t == str(ta)
+
+        # Overwrite with second request context
+        await set_user_context(session, u2)
+        await set_tenant_context(session, tb)
+        await session.commit()
+
+        curr_t2 = (await session.execute(text("SELECT current_setting('app.current_tenant_id', true)"))).scalar()
+        curr_u2 = (await session.execute(text("SELECT current_setting('app.current_user_id', true)"))).scalar()
+        assert curr_t2 == str(tb)
+        assert curr_u2 == str(u2)
+
+    await test_engine.dispose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_switch_tenant_e2e_flow(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test 15: End-to-end switch tenant flow from Tenant A to Tenant B."""
+    from app.api.v1.endpoints.auth import switch_tenant
+    from app.schemas.auth import SwitchTenantRequest
+
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+    tenant_b_id = ctx["tenant_b_id"]
+
+    # Initial token in Tenant A
+    token_a = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
+    )
+    payload_a = decode_token(token_a)
+    assert payload_a["tenant_id"] == str(tenant_a_id)
+    assert payload_a["role"] == "OWNER"
+
+    # User switches to Tenant B
+    auth_user = CurrentUser(
+        id=user_1_id,
+        email="u1@example.com",
+        tenant_id=tenant_a_id,
+        role="OWNER",
+    )
+    req = SwitchTenantRequest(tenant_id=tenant_b_id)
+    resp = await switch_tenant(request=req, current_user=auth_user, session=db_session)
+
+    # Validates new token bound to Tenant B with VIEWER role
+    payload_b = decode_token(resp.access_token)
+    assert payload_b["sub"] == str(user_1_id)
+    assert payload_b["tenant_id"] == str(tenant_b_id)
+    assert payload_b["role"] == "VIEWER"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_domain_endpoint_rejects_x_tenant_id_with_http_400():
+    """Behavioral Test 16: Supplying deprecated X-Tenant-ID header is rejected with HTTP 400."""
+    from app.api.deps import get_current_tenant_id
+
+    with pytest.raises(HTTPException) as excinfo:
+        await get_current_tenant_id(x_tenant_id="some-tenant-id")
+
+    assert excinfo.value.status_code == 400
+    assert "The 'X-Tenant-ID' header is deprecated" in excinfo.value.detail
