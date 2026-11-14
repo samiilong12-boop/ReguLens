@@ -57,7 +57,16 @@ from app.db.session import (
     set_tenant_context,
     set_user_context,
 )
-from app.api.deps import CurrentUser, get_tenant_db
+from app.api.deps import (
+    CurrentUser,
+    get_current_tenant_user,
+    get_tenant_db,
+    require_admin,
+    require_compliance_officer,
+    require_owner,
+    require_role,
+    require_viewer,
+)
 
 DATABASE_TEST_URL = os.getenv("DATABASE_TEST_URL", settings.DATABASE_URL)
 DATABASE_ADMIN_TEST_URL = os.getenv("DATABASE_ADMIN_TEST_URL")
@@ -1278,19 +1287,27 @@ async def test_role_demotion_reflected_live(
     db_session: AsyncSession,
     provisioned_multi_tenant_users: dict,
 ):
-    """Behavioral Test 8: Role demotion in database is reflected live on next request."""
+    """Behavioral Test 8: An OWNER token cannot retain OWNER privileges after DB demotion to VIEWER.
+    
+    Proves:
+    1. User 1 initially has OWNER role and presents an unexpired token with role='OWNER'.
+    2. Admin demotes User 1 to VIEWER in tenant_users in the database.
+    3. Operation requiring OWNER role is executed.
+    4. Asserts live database role is loaded and access is strictly DENIED with HTTP 403,
+       not merely that a database session was yielded.
+    """
     ctx = provisioned_multi_tenant_users
     user_1_id = ctx["user_1_id"]
     tenant_a_id = ctx["tenant_a_id"]
 
-    # Demote user from OWNER to VIEWER in database
+    # 1. Demote user from OWNER to VIEWER in database
     await admin_session.execute(
         text("UPDATE tenant_users SET role = 'VIEWER' WHERE id = :id"),
         {"id": str(ctx["m_1_a_id"])},
     )
     await admin_session.commit()
 
-    # User presents token that still claims "OWNER"
+    # 2. User presents unexpired token that still claims role="OWNER"
     token_a = create_access_token(
         data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
     )
@@ -1301,6 +1318,119 @@ async def test_role_demotion_reflected_live(
     )
     yielded_session = await anext(agen)
     assert yielded_session is not None
+
+    # 3. Resolve live authorized tenant user context
+    tenant_user = await get_current_tenant_user(db=yielded_session)
+    assert tenant_user.role == "VIEWER", "Security defect: Stale token role retained over live DB role!"
+
+    # 4. Attempt OWNER-only operation -> MUST fail closed with HTTP 403
+    with pytest.raises(HTTPException) as excinfo:
+        await require_owner(current_user=tenant_user)
+
+    assert excinfo.value.status_code == 403
+    assert "insufficient permissions" in excinfo.value.detail.lower()
+    await agen.aclose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_viewer_cannot_execute_owner_operation(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test: A legitimate VIEWER is denied execution of an OWNER-only operation with HTTP 403."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # User 1 is legitimate VIEWER in Tenant B
+
+    viewer_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "VIEWER"}
+    )
+    agen = get_tenant_db(
+        authorization=f"Bearer {viewer_token}",
+        tenant_id=tenant_b_id,
+        db=db_session,
+    )
+    session = await anext(agen)
+    tenant_user = await get_current_tenant_user(db=session)
+    assert tenant_user.role == "VIEWER"
+
+    with pytest.raises(HTTPException) as excinfo:
+        await require_owner(current_user=tenant_user)
+
+    assert excinfo.value.status_code == 403
+    assert "insufficient permissions" in excinfo.value.detail.lower()
+    await agen.aclose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_role_promotion_reflected_live(
+    admin_session: AsyncSession,
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test: Role promotion in database is immediately reflected without re-issuing token."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # Initially VIEWER in Tenant B
+
+    # 1. Promote user from VIEWER to OWNER in database
+    await admin_session.execute(
+        text("UPDATE tenant_users SET role = 'OWNER' WHERE id = :id"),
+        {"id": str(ctx["m_1_b_id"])},
+    )
+    await admin_session.commit()
+
+    # 2. Client presents unexpired token that still claims "VIEWER"
+    stale_viewer_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "VIEWER"}
+    )
+    agen = get_tenant_db(
+        authorization=f"Bearer {stale_viewer_token}",
+        tenant_id=tenant_b_id,
+        db=db_session,
+    )
+    session = await anext(agen)
+    tenant_user = await get_current_tenant_user(db=session)
+
+    # Live DB promotion is immediately active
+    assert tenant_user.role == "OWNER"
+
+    # 3. OWNER-only operation succeeds immediately
+    authorized_user = await require_owner(current_user=tenant_user)
+    assert authorized_user.role == "OWNER"
+    await agen.aclose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_jwt_role_tampering_cannot_grant_privileges(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test: Forged or tampered role claim in a valid JWT cannot bypass database authorization."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # Real DB role is VIEWER
+
+    # Attacker crafts token claiming role="OWNER"
+    tampered_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "OWNER"}
+    )
+    agen = get_tenant_db(
+        authorization=f"Bearer {tampered_token}",
+        tenant_id=tenant_b_id,
+        db=db_session,
+    )
+    session = await anext(agen)
+    tenant_user = await get_current_tenant_user(db=session)
+
+    # System strictly overwrites tampered claim with live database role (VIEWER)
+    assert tenant_user.role == "VIEWER"
+
+    with pytest.raises(HTTPException) as excinfo:
+        await require_owner(current_user=tenant_user)
+
+    assert excinfo.value.status_code == 403
+    assert "insufficient permissions" in excinfo.value.detail.lower()
     await agen.aclose()
 
 

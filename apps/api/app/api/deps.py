@@ -31,7 +31,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def get_current_user(
     authorization: Optional[str] = Header(None),
 ) -> CurrentUser:
-    """Extracts, validates, and decodes the authenticated user from the Authorization Bearer token."""
+    """Extracts and validates user identity from JWT bearer token for authentication-only flows.
+    
+    NOTE: The role claim in the JWT is informational from minting time and MUST NOT
+    be used for privileged authorization decisions in tenant context. Use get_current_tenant_user
+    or require_role() to guarantee evaluation against the live database membership role.
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -157,10 +162,72 @@ async def get_tenant_db(
             detail="Forbidden: User is not an active member of this organization.",
         )
 
-    # Update in-memory user role to live database role
-    user.role = current_role
+    # 5. Bind live verified authorized user to the session info for downstream dependency access
+    authorized_user = CurrentUser(
+        id=user.id,
+        email=user.email,
+        role=current_role,
+        tenant_id=tenant_id,
+    )
+    db.sync_session.info["authorized_user"] = authorized_user
 
     try:
         yield db
     finally:
         pass
+
+
+async def get_current_tenant_user(
+    db: AsyncSession = Depends(get_tenant_db),
+) -> CurrentUser:
+    """Provides the live database-verified CurrentUser for the active tenant.
+    
+    Security guarantees:
+    1. Depends on get_tenant_db, guaranteeing that transaction-scoped GUCs are armed
+       and that User.is_active, Tenant.is_active, and TenantUser membership were verified.
+    2. role is guaranteed to be the live TenantUser.role from PostgreSQL, NEVER the stale JWT claim.
+    3. Exposes the authorized user to downstream role-based access control dependencies.
+    """
+    authorized_user = db.sync_session.info.get("authorized_user")
+    if not authorized_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication failed: Unable to resolve authorized tenant user context.",
+        )
+    return authorized_user
+
+
+def require_role(*allowed_roles: str):
+    """Factory for dependency that enforces membership role authorization.
+    
+    Strictly checks the live database membership role (via get_current_tenant_user),
+    never the unverified or stale JWT role.
+    """
+    normalized_allowed = {r.strip().upper() for r in allowed_roles}
+
+    async def role_checker(
+        current_user: CurrentUser = Depends(get_current_tenant_user),
+    ) -> CurrentUser:
+        if not current_user.role or current_user.role.strip().upper() not in normalized_allowed:
+            logger.warning(
+                "role_authorization_denied",
+                user_id=str(current_user.id),
+                tenant_id=str(current_user.tenant_id),
+                required_roles=sorted(list(normalized_allowed)),
+                actual_role=current_user.role,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Forbidden: Insufficient permissions for this operation. Required role: {', '.join(sorted(normalized_allowed))}.",
+            )
+        return current_user
+
+    return role_checker
+
+
+# Granular role guards adhering to docs/SECURITY_ARCHITECTURE.md
+require_owner = require_role("OWNER")
+require_admin = require_role("OWNER", "ADMIN")
+require_compliance_officer = require_role("OWNER", "ADMIN", "COMPLIANCE_OFFICER")
+require_reviewer = require_role("OWNER", "ADMIN", "COMPLIANCE_OFFICER", "HUMAN_REVIEWER")
+require_viewer = require_role("OWNER", "ADMIN", "COMPLIANCE_OFFICER", "HUMAN_REVIEWER", "VIEWER")
