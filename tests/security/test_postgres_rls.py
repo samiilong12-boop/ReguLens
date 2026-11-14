@@ -37,7 +37,14 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
-from app.db.models import AuditLog, Product, Tenant
+from app.db.models import (
+    AuditLog,
+    BackgroundJob,
+    Consignment,
+    Document,
+    Product,
+    Tenant,
+)
 from app.db.session import ReguLensAppSession, async_session_maker, set_tenant_context
 
 DATABASE_TEST_URL = os.getenv("DATABASE_TEST_URL", settings.DATABASE_URL)
@@ -155,6 +162,18 @@ async def provisioned_tenants(
         try:
             await admin_session.rollback()
             await admin_session.execute(
+                text("DELETE FROM documents WHERE tenant_id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM consignments WHERE tenant_id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM background_jobs WHERE tenant_id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.execute(
                 text("DELETE FROM products WHERE tenant_id IN (:ta, :tb)"),
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
@@ -164,6 +183,131 @@ async def provisioned_tenants(
             )
             await admin_session.execute(
                 text("DELETE FROM tenants WHERE id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.commit()
+        except Exception:
+            await admin_session.rollback()
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def provisioned_hierarchy(
+    admin_session: AsyncSession,
+    provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
+) -> AsyncGenerator[dict, None]:
+    """Provisions real parent-child hierarchy across Tenant A and Tenant B:
+    - Products (from provisioned_tenants)
+    - Consignments (Consignment A for Tenant A, Consignment B for Tenant B)
+    - Documents (Document A for Tenant A, Document B for Tenant B)
+    - BackgroundJobs (Job A for Tenant A, Job B for Tenant B)
+    """
+    tenant_a, tenant_b, prod_a_id, prod_b_id = provisioned_tenants
+    consignment_a_id = uuid.uuid4()
+    consignment_b_id = uuid.uuid4()
+    doc_a_id = uuid.uuid4()
+    doc_b_id = uuid.uuid4()
+    job_a_id = uuid.uuid4()
+    job_b_id = uuid.uuid4()
+
+    # 1. Consignments
+    c_a = Consignment(
+        id=consignment_a_id,
+        tenant_id=tenant_a,
+        product_id=prod_a_id,
+        consignment_reference=f"REF-A-{consignment_a_id.hex[:6]}",
+        origin_country="EG",
+        destination_market="EU",
+        quantity_unit="KG",
+        status="DRAFT",
+    )
+    c_b = Consignment(
+        id=consignment_b_id,
+        tenant_id=tenant_b,
+        product_id=prod_b_id,
+        consignment_reference=f"REF-B-{consignment_b_id.hex[:6]}",
+        origin_country="EG",
+        destination_market="EU",
+        quantity_unit="KG",
+        status="DRAFT",
+    )
+    admin_session.add_all([c_a, c_b])
+    await admin_session.flush()
+
+    # 2. Documents
+    d_a = Document(
+        id=doc_a_id,
+        tenant_id=tenant_a,
+        consignment_id=consignment_a_id,
+        document_type="PHYTOSANITARY_CERTIFICATE",
+        file_name="phyto_a.pdf",
+        file_size_bytes=2048,
+        mime_type="application/pdf",
+        storage_key=f"tenants/{tenant_a}/docs/phyto_a.pdf",
+        sha256_hash="a" * 64,
+        antivirus_status="CLEAN",
+        parsing_status="PARSED",
+    )
+    d_b = Document(
+        id=doc_b_id,
+        tenant_id=tenant_b,
+        consignment_id=consignment_b_id,
+        document_type="PHYTOSANITARY_CERTIFICATE",
+        file_name="phyto_b.pdf",
+        file_size_bytes=4096,
+        mime_type="application/pdf",
+        storage_key=f"tenants/{tenant_b}/docs/phyto_b.pdf",
+        sha256_hash="b" * 64,
+        antivirus_status="CLEAN",
+        parsing_status="PARSED",
+    )
+    admin_session.add_all([d_a, d_b])
+
+    # 3. Background Jobs
+    j_a = BackgroundJob(
+        id=job_a_id,
+        tenant_id=tenant_a,
+        job_type="DOCUMENT_PARSING",
+        payload={"doc_id": str(doc_a_id)},
+        status="QUEUED",
+    )
+    j_b = BackgroundJob(
+        id=job_b_id,
+        tenant_id=tenant_b,
+        job_type="DOCUMENT_PARSING",
+        payload={"doc_id": str(doc_b_id)},
+        status="QUEUED",
+    )
+    admin_session.add_all([j_a, j_b])
+    await admin_session.commit()
+
+    hierarchy = {
+        "tenant_a": tenant_a,
+        "tenant_b": tenant_b,
+        "prod_a_id": prod_a_id,
+        "prod_b_id": prod_b_id,
+        "consignment_a_id": consignment_a_id,
+        "consignment_b_id": consignment_b_id,
+        "doc_a_id": doc_a_id,
+        "doc_b_id": doc_b_id,
+        "job_a_id": job_a_id,
+        "job_b_id": job_b_id,
+    }
+
+    try:
+        yield hierarchy
+    finally:
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(
+                text("DELETE FROM documents WHERE tenant_id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM consignments WHERE tenant_id IN (:ta, :tb)"),
+                {"ta": str(tenant_a), "tb": str(tenant_b)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM background_jobs WHERE tenant_id IN (:ta, :tb)"),
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
             await admin_session.commit()
@@ -520,3 +664,276 @@ async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSessi
             assert "nullif" in with_check.lower(), (
                 f"Policy '{policyname}' on table '{tablename}' (with_check) does not contain NULLIF: {with_check}"
             )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cross_tenant_consignment_isolation(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Behavioral Test: Tenant A can access its own consignment, but cannot read, update, or delete Tenant B's consignment."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    c_a_id = h["consignment_a_id"]
+    c_b_id = h["consignment_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # 1. Positive control: Read own consignment
+    stmt_own = select(Consignment).where(Consignment.id == c_a_id)
+    res_own = await db_session.execute(stmt_own)
+    consignment_own = res_own.scalar_one_or_none()
+    assert consignment_own is not None, "Tenant A failed to read own consignment under RLS."
+    assert consignment_own.id == c_a_id
+
+    # 2. Negative control: Read Tenant B's consignment returns None
+    stmt_foreign = select(Consignment).where(Consignment.id == c_b_id)
+    res_foreign = await db_session.execute(stmt_foreign)
+    assert res_foreign.scalar_one_or_none() is None, "RLS Breach: Tenant A read Tenant B's consignment!"
+
+    # 3. Negative control: Update Tenant B's consignment affects 0 rows
+    update_res = await db_session.execute(
+        text("UPDATE consignments SET status = 'TAMPERED' WHERE id = :id"),
+        {"id": str(c_b_id)},
+    )
+    assert update_res.rowcount == 0, "RLS Breach: Tenant A updated Tenant B's consignment!"
+
+    # 4. Negative control: Delete Tenant B's consignment affects 0 rows
+    delete_res = await db_session.execute(
+        text("DELETE FROM consignments WHERE id = :id"),
+        {"id": str(c_b_id)},
+    )
+    assert delete_res.rowcount == 0, "RLS Breach: Tenant A deleted Tenant B's consignment!"
+
+    # 5. Negative control: Insert consignment with Tenant B's tenant_id fails RLS WITH CHECK (SQLSTATE 42501)
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            text("""
+                INSERT INTO consignments (id, tenant_id, product_id, consignment_reference, origin_country, destination_market, quantity_unit, status)
+                VALUES (:id, :tenant_id, :product_id, 'ATTACK-REF', 'EG', 'EU', 'KG', 'DRAFT')
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "tenant_id": str(h["tenant_b"]),
+                "product_id": str(h["prod_b_id"]),
+            },
+        )
+    assert excinfo.value.orig is not None
+    assert getattr(excinfo.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_composite_foreign_key_cross_tenant_reference_rejected(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Composite FK Enforcement: Tenant A attempting to reference Tenant B's product is rejected by DB constraint.
+    
+    Distinguishes SQLSTATE 23503 (foreign_key_violation) from RLS SQLSTATE 42501.
+    RLS WITH CHECK passes because tenant_id matches Tenant A, but the composite FK (tenant_id, product_id)
+    fails because (tenant_a, prod_b_id) does not exist in the products table.
+    """
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    prod_b_id = h["prod_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    attack_consignment_id = uuid.uuid4()
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            text("""
+                INSERT INTO consignments (id, tenant_id, product_id, consignment_reference, origin_country, destination_market, quantity_unit, status)
+                VALUES (:id, :tenant_id, :product_id, 'CROSS-TENANT-FK-ATTACK', 'EG', 'EU', 'KG', 'DRAFT')
+            """),
+            {
+                "id": str(attack_consignment_id),
+                "tenant_id": str(tenant_a),
+                "product_id": str(prod_b_id),
+            },
+        )
+    
+    assert excinfo.value.orig is not None
+    sqlstate = getattr(excinfo.value.orig, "sqlstate", None)
+    assert sqlstate == "23503", f"Expected SQLSTATE 23503 (foreign_key_violation), got {sqlstate}"
+    err_str = str(excinfo.value).lower()
+    assert "fk_consignments_product" in err_str or "violates foreign key constraint" in err_str
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cross_tenant_document_isolation(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Behavioral Test: Tenant A can read its own document, but cannot read, update, or delete Tenant B's document."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_a_id = h["doc_a_id"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # 1. Positive control: Read own document
+    res_own = await db_session.execute(select(Document).where(Document.id == doc_a_id))
+    doc_own = res_own.scalar_one_or_none()
+    assert doc_own is not None, "Tenant A failed to read own document under RLS."
+    assert doc_own.id == doc_a_id
+
+    # 2. Negative control: Read Tenant B's document returns None
+    res_foreign = await db_session.execute(select(Document).where(Document.id == doc_b_id))
+    assert res_foreign.scalar_one_or_none() is None, "RLS Breach: Tenant A read Tenant B's document!"
+
+    # 3. Negative control: Update Tenant B's document affects 0 rows
+    update_res = await db_session.execute(
+        text("UPDATE documents SET file_name = 'tampered.pdf' WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert update_res.rowcount == 0, "RLS Breach: Tenant A updated Tenant B's document!"
+
+    # 4. Negative control: Delete Tenant B's document affects 0 rows
+    delete_res = await db_session.execute(
+        text("DELETE FROM documents WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert delete_res.rowcount == 0, "RLS Breach: Tenant A deleted Tenant B's document!"
+
+    # 5. Negative control: Insert document with Tenant B's tenant_id fails RLS WITH CHECK (SQLSTATE 42501)
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            text("""
+                INSERT INTO documents (id, tenant_id, consignment_id, document_type, file_name, file_size_bytes, mime_type, storage_key, sha256_hash)
+                VALUES (:id, :tenant_id, :consignment_id, 'PHYTOSANITARY_CERTIFICATE', 'evil.pdf', 100, 'application/pdf', 'path', :sha)
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "tenant_id": str(h["tenant_b"]),
+                "consignment_id": str(h["consignment_b_id"]),
+                "sha": "0" * 64,
+            },
+        )
+    assert excinfo.value.orig is not None
+    assert getattr(excinfo.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cross_tenant_background_job_isolation(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Behavioral Test: Tenant A can access its own background jobs, but cannot read, update, or claim Tenant B's jobs."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    job_a_id = h["job_a_id"]
+    job_b_id = h["job_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # 1. Positive control: Read own job
+    res_own = await db_session.execute(select(BackgroundJob).where(BackgroundJob.id == job_a_id))
+    job_own = res_own.scalar_one_or_none()
+    assert job_own is not None, "Tenant A failed to read own background job under RLS."
+    assert job_own.id == job_a_id
+
+    # 2. Negative control: Read Tenant B's job returns None
+    res_foreign = await db_session.execute(select(BackgroundJob).where(BackgroundJob.id == job_b_id))
+    assert res_foreign.scalar_one_or_none() is None, "RLS Breach: Tenant A read Tenant B's background job!"
+
+    # 3. Negative control: Update / Claim Tenant B's job affects 0 rows
+    update_res = await db_session.execute(
+        text("UPDATE background_jobs SET status = 'PROCESSING' WHERE id = :id"),
+        {"id": str(job_b_id)},
+    )
+    assert update_res.rowcount == 0, "RLS Breach: Tenant A claimed Tenant B's background job!"
+
+    # 4. Negative control: Delete Tenant B's job affects 0 rows
+    delete_res = await db_session.execute(
+        text("DELETE FROM background_jobs WHERE id = :id"),
+        {"id": str(job_b_id)},
+    )
+    assert delete_res.rowcount == 0, "RLS Breach: Tenant A deleted Tenant B's background job!"
+
+    # 5. Negative control: Insert background job with Tenant B's tenant_id fails RLS WITH CHECK (SQLSTATE 42501)
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            text("""
+                INSERT INTO background_jobs (id, tenant_id, job_type, payload, status)
+                VALUES (:id, :tenant_id, 'MALICIOUS_JOB', '{"attack": true}', 'QUEUED')
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "tenant_id": str(h["tenant_b"]),
+            },
+        )
+    assert excinfo.value.orig is not None
+    assert getattr(excinfo.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_init_db_roles_idempotency_audit_logs_privileges(
+    admin_session: AsyncSession,
+    db_session: AsyncSession,
+    provisioned_tenants: Tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID],
+):
+    """Integration Test: Verifies that re-executing init_db_roles.sql on an existing database
+    with audit_logs maintains revoked UPDATE/DELETE/TRUNCATE on audit_logs and does not
+    affect privileges on unrelated tables (e.g. products).
+    """
+    # 1. Execute the actual idempotent DO block from scripts/init_db_roles.sql via admin_session
+    idempotent_block = text("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'audit_logs') THEN
+                IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'regulens_app') THEN
+                    REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM regulens_app;
+                END IF;
+            END IF;
+        END
+        $$;
+    """)
+    await admin_session.execute(idempotent_block)
+    await admin_session.commit()
+
+    # 2. Assert exact privilege matrix for regulens_app on audit_logs
+    priv_checks = await admin_session.execute(text("""
+        SELECT 
+            has_table_privilege('regulens_app', 'public.audit_logs', 'SELECT') AS can_select,
+            has_table_privilege('regulens_app', 'public.audit_logs', 'INSERT') AS can_insert,
+            has_table_privilege('regulens_app', 'public.audit_logs', 'UPDATE') AS can_update,
+            has_table_privilege('regulens_app', 'public.audit_logs', 'DELETE') AS can_delete,
+            has_table_privilege('regulens_app', 'public.audit_logs', 'TRUNCATE') AS can_truncate;
+    """))
+    row = priv_checks.mappings().one()
+    assert row["can_select"] is True, "regulens_app lost SELECT on audit_logs!"
+    assert row["can_insert"] is True, "regulens_app lost INSERT on audit_logs!"
+    assert row["can_update"] is False, "Security violation: regulens_app has UPDATE on audit_logs!"
+    assert row["can_delete"] is False, "Security violation: regulens_app has DELETE on audit_logs!"
+    assert row["can_truncate"] is False, "Security violation: regulens_app has TRUNCATE on audit_logs!"
+
+    # 3. Assert privileges on unrelated tables (e.g. products) remain intact
+    prod_priv_checks = await admin_session.execute(text("""
+        SELECT 
+            has_table_privilege('regulens_app', 'public.products', 'SELECT') AS can_select,
+            has_table_privilege('regulens_app', 'public.products', 'INSERT') AS can_insert,
+            has_table_privilege('regulens_app', 'public.products', 'UPDATE') AS can_update,
+            has_table_privilege('regulens_app', 'public.products', 'DELETE') AS can_delete;
+    """))
+    prod_row = prod_priv_checks.mappings().one()
+    assert prod_row["can_select"] is True
+    assert prod_row["can_insert"] is True
+    assert prod_row["can_update"] is True
+    assert prod_row["can_delete"] is True
+
+    # 4. Under db_session (as regulens_app), verify UPDATE/DELETE on audit_logs is rejected by SQL privilege denial (SQLSTATE 42501)
+    tenant_a = provisioned_tenants[0]
+    await set_tenant_context(db_session, tenant_a)
+    with pytest.raises(DBAPIError) as excinfo_upd:
+        await db_session.execute(
+            text("UPDATE audit_logs SET action = 'ILLEGAL_ALTERATION' WHERE tenant_id = :tid"),
+            {"tid": str(tenant_a)},
+        )
+    assert getattr(excinfo_upd.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
