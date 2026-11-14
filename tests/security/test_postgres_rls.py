@@ -1926,3 +1926,226 @@ async def test_fastapi_dependency_caching_consistent_session(
     assert data["role"] == "OWNER"
     assert data["user_id"] == str(user_1_id)
     assert "session_id" in data
+
+
+# ============================================================================
+# Migration 0003 Downgrade & Upgrade Lifecycle Verification Gate
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSession):
+    """Behavioral Gate: Alembic downgrade to 0002 and upgrade to 0003 cycle against PostgreSQL 16.
+    
+    Verifies:
+    1. Precondition: Starts from current Package B migration head (0003_membership_rls_policies).
+    2. Data preservation precondition: Seeds an active tenant, user, and membership row.
+    3. Downgrade -1 executes cleanly to 0002_harden_rls_policies.
+    4. Migration 0003's four policies are completely removed.
+    5. Package A policies (rls_tenant_users, rls_tenants) are restored with NULLIF protections.
+    6. Re-upgrade to head executes cleanly back to 0003_membership_rls_policies.
+    7. Migration 0003's four policies are restored with exact security expressions and NULLIF protections.
+    8. Expected Alembic revision is verified after upgrade.
+    9. Confirms existing tenant membership data remains intact and undamaged across the migration cycle.
+    """
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+    from app.core.config import settings
+
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+    settings.DATABASE_MIGRATION_URL = migration_url
+    os.environ["DATABASE_MIGRATION_URL"] = migration_url
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # 1. Verify initial head precondition
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    initial_version = res.scalar()
+    assert initial_version == "0003_membership_rls_policies", (
+        f"Precondition failed: Expected 0003_membership_rls_policies, got {initial_version}"
+    )
+
+    # 2. Seed test data to verify data preservation across migration cycle
+    test_tenant_id = uuid.uuid4()
+    test_user_id = uuid.uuid4()
+    test_membership_id = uuid.uuid4()
+    test_email = f"mig_{test_user_id.hex[:8]}@example.com"
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO tenants (id, name, country, is_active)
+            VALUES (:t_id, 'Migration Preserved Tenant', 'EG', true);
+        """),
+        {"t_id": str(test_tenant_id)},
+    )
+    await admin_session.execute(
+        text("""
+            INSERT INTO users (id, email, password_hash, full_name, is_active)
+            VALUES (:u_id, :email, 'fake_hash', 'Migration User', true);
+        """),
+        {"u_id": str(test_user_id), "email": test_email},
+    )
+    await admin_session.execute(
+        text("""
+            INSERT INTO tenant_users (id, tenant_id, user_id, role)
+            VALUES (:m_id, :t_id, :u_id, 'OWNER');
+        """),
+        {"m_id": str(test_membership_id), "t_id": str(test_tenant_id), "u_id": str(test_user_id)},
+    )
+    # Commit seed data and release all locks so Alembic DDL can run without lock contention
+    await admin_session.commit()
+
+    try:
+        # 3. Execute alembic downgrade -1
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "-1")
+
+        # Verify revision after downgrade
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        down_version = res.scalar()
+        assert down_version == "0002_harden_rls_policies", (
+            f"Downgrade failed: Expected 0002_harden_rls_policies, got {down_version}"
+        )
+
+        # 4. Verify Migration 0003's four policies are completely removed
+        res = await admin_session.execute(
+            text("""
+                SELECT policyname, tablename, cmd, qual, with_check
+                FROM pg_policies
+                WHERE schemaname = 'public' AND tablename IN ('tenant_users', 'tenants');
+            """)
+        )
+        policies_down = {row.policyname: row for row in res.fetchall()}
+
+        assert "rls_tenant_users_tenant_scope" not in policies_down, "Leaked 0003 tenant_users tenant_scope policy after downgrade"
+        assert "rls_tenant_users_user_scope" not in policies_down, "Leaked 0003 tenant_users user_scope policy after downgrade"
+        assert "rls_tenants_tenant_scope" not in policies_down, "Leaked 0003 tenants tenant_scope policy after downgrade"
+        assert "rls_tenants_user_scope" not in policies_down, "Leaked 0003 tenants user_scope policy after downgrade"
+
+        # 5. Verify Package A policies are restored correctly with NULLIF protections
+        assert "rls_tenant_users" in policies_down, "Package A rls_tenant_users policy not restored after downgrade"
+        assert "rls_tenants" in policies_down, "Package A rls_tenants policy not restored after downgrade"
+
+        tu_down = policies_down["rls_tenant_users"]
+        assert "nullif" in tu_down.qual.lower(), "Restored rls_tenant_users missing NULLIF in qual"
+        assert "nullif" in tu_down.with_check.lower(), "Restored rls_tenant_users missing NULLIF in with_check"
+
+        t_down = policies_down["rls_tenants"]
+        assert "nullif" in t_down.qual.lower(), "Restored rls_tenants missing NULLIF in qual"
+
+        # 6. Execute alembic upgrade head
+        # Commit session before running upgrade to ensure idle state
+        await admin_session.commit()
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+
+        # 7. Verify expected Alembic revision after upgrade
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        up_version = res.scalar()
+        assert up_version == "0003_membership_rls_policies", (
+            f"Upgrade failed: Expected 0003_membership_rls_policies, got {up_version}"
+        )
+
+        # 8. Verify Migration 0003's four policies are restored correctly
+        res = await admin_session.execute(
+            text("""
+                SELECT policyname, tablename, cmd, qual, with_check
+                FROM pg_policies
+                WHERE schemaname = 'public' AND tablename IN ('tenant_users', 'tenants');
+            """)
+        )
+        policies_up = {row.policyname: row for row in res.fetchall()}
+
+        assert "rls_tenant_users_tenant_scope" in policies_up
+        assert "rls_tenant_users_user_scope" in policies_up
+        assert "rls_tenants_tenant_scope" in policies_up
+        assert "rls_tenants_user_scope" in policies_up
+
+        # Package A single policies must NOT remain
+        assert "rls_tenant_users" not in policies_up
+        assert "rls_tenants" not in policies_up
+
+        # Verify exact expressions
+        tu_tenant = policies_up["rls_tenant_users_tenant_scope"]
+        assert "nullif" in tu_tenant.qual.lower()
+        assert "nullif" in tu_tenant.with_check.lower()
+        assert "app.current_tenant_id" in tu_tenant.qual.lower()
+
+        tu_user = policies_up["rls_tenant_users_user_scope"]
+        assert tu_user.cmd.upper() == "SELECT"
+        assert "nullif" in tu_user.qual.lower()
+        assert "app.current_user_id" in tu_user.qual.lower()
+
+        t_tenant = policies_up["rls_tenants_tenant_scope"]
+        assert t_tenant.cmd.upper() == "SELECT"
+        assert "nullif" in t_tenant.qual.lower()
+        assert "app.current_tenant_id" in t_tenant.qual.lower()
+
+        t_user = policies_up["rls_tenants_user_scope"]
+        assert t_user.cmd.upper() == "SELECT"
+        assert "exists" in t_user.qual.lower()
+        assert "nullif" in t_user.qual.lower()
+        assert "app.current_user_id" in t_user.qual.lower()
+
+        # 9. Confirm that the migration cycle does not damage existing tenant membership data
+        t_row = (await admin_session.execute(
+            text("SELECT id, name, is_active FROM tenants WHERE id = :id"),
+            {"id": str(test_tenant_id)},
+        )).first()
+        assert t_row is not None, "Tenant row was damaged or lost during migration cycle"
+        assert t_row.name == "Migration Preserved Tenant"
+        assert t_row.is_active is True
+
+        u_row = (await admin_session.execute(
+            text("SELECT id, email, is_active FROM users WHERE id = :id"),
+            {"id": str(test_user_id)},
+        )).first()
+        assert u_row is not None, "User row was damaged or lost during migration cycle"
+        assert u_row.email == test_email
+        assert u_row.is_active is True
+
+        m_row = (await admin_session.execute(
+            text("SELECT id, tenant_id, user_id, role FROM tenant_users WHERE id = :id"),
+            {"id": str(test_membership_id)},
+        )).first()
+        assert m_row is not None, "TenantUser membership row was damaged or lost during migration cycle"
+        assert m_row.tenant_id == test_tenant_id
+        assert m_row.user_id == test_user_id
+        assert m_row.role == "OWNER"
+
+    finally:
+        # Cleanup test data and ensure database is restored to 0003 head even if an assertion failed
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(
+                text("DELETE FROM tenant_users WHERE id = :id"),
+                {"id": str(test_membership_id)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM tenants WHERE id = :id"),
+                {"id": str(test_tenant_id)},
+            )
+            await admin_session.execute(
+                text("DELETE FROM users WHERE id = :id"),
+                {"id": str(test_user_id)},
+            )
+            await admin_session.commit()
+        except Exception:
+            await admin_session.rollback()
+
+        # Ensure alembic is at head if anything failed mid-downgrade
+        try:
+            res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_ver = res.scalar()
+            if cur_ver != "0003_membership_rls_policies":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        except Exception:
+            pass
