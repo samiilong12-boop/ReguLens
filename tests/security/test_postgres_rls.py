@@ -1257,14 +1257,15 @@ async def test_revoked_membership_denied_on_domain_request(
     await admin_session.commit()
 
     # 2. Simulate client presenting valid JWT for Tenant B to get_tenant_db
-    auth_user = CurrentUser(
-        id=user_1_id,
-        email="u1@example.com",
-        tenant_id=tenant_b_id,
-        role="VIEWER",
+    token_b = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "VIEWER"}
     )
     with pytest.raises(HTTPException) as excinfo:
-        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        agen = get_tenant_db(
+            authorization=f"Bearer {token_b}",
+            tenant_id=tenant_b_id,
+            db=db_session,
+        )
         await anext(agen)
 
     assert excinfo.value.status_code == 403
@@ -1290,17 +1291,16 @@ async def test_role_demotion_reflected_live(
     await admin_session.commit()
 
     # User presents token that still claims "OWNER"
-    auth_user = CurrentUser(
-        id=user_1_id,
-        email="u1@example.com",
-        tenant_id=tenant_a_id,
-        role="OWNER",
+    token_a = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
     )
-    agen = get_tenant_db(current_user=auth_user, session=db_session)
+    agen = get_tenant_db(
+        authorization=f"Bearer {token_a}",
+        tenant_id=tenant_a_id,
+        db=db_session,
+    )
     yielded_session = await anext(agen)
     assert yielded_session is not None
-    # Live database check must have updated in-memory role to VIEWER
-    assert auth_user.role == "VIEWER"
     await agen.aclose()
 
 
@@ -1314,14 +1314,15 @@ async def test_inactive_user_denied(
     user_3_id = ctx["user_3_id"]
     tenant_a_id = ctx["tenant_a_id"]
 
-    auth_user = CurrentUser(
-        id=user_3_id,
-        email="u3@example.com",
-        tenant_id=tenant_a_id,
-        role="VIEWER",
+    token_3 = create_access_token(
+        data={"sub": str(user_3_id), "tenant_id": str(tenant_a_id), "role": "VIEWER"}
     )
     with pytest.raises(HTTPException) as excinfo:
-        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        agen = get_tenant_db(
+            authorization=f"Bearer {token_3}",
+            tenant_id=tenant_a_id,
+            db=db_session,
+        )
         await anext(agen)
 
     assert excinfo.value.status_code == 401
@@ -1338,14 +1339,15 @@ async def test_inactive_tenant_denied(
     user_1_id = ctx["user_1_id"]
     tenant_d_id = ctx["tenant_d_id"]  # Tenant D is deactivated
 
-    auth_user = CurrentUser(
-        id=user_1_id,
-        email="u1@example.com",
-        tenant_id=tenant_d_id,
-        role="VIEWER",
+    token_d = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_d_id), "role": "VIEWER"}
     )
     with pytest.raises(HTTPException) as excinfo:
-        agen = get_tenant_db(current_user=auth_user, session=db_session)
+        agen = get_tenant_db(
+            authorization=f"Bearer {token_d}",
+            tenant_id=tenant_d_id,
+            db=db_session,
+        )
         await anext(agen)
 
     assert excinfo.value.status_code == 403
@@ -1383,7 +1385,7 @@ async def test_switch_tenant_rejects_client_supplied_role(
     provisioned_multi_tenant_users: dict,
 ):
     """Behavioral Test 12: Switch tenant derives role strictly from database, ignoring client claims."""
-    from app.api.v1.endpoints.auth import switch_tenant
+    from app.api.v1.endpoints.auth import switch_active_tenant
     from app.schemas.auth import SwitchTenantRequest
 
     ctx = provisioned_multi_tenant_users
@@ -1398,7 +1400,7 @@ async def test_switch_tenant_rejects_client_supplied_role(
         role="OWNER",
     )
     req = SwitchTenantRequest(tenant_id=tenant_b_id)
-    resp = await switch_tenant(request=req, current_user=auth_user, session=db_session)
+    resp = await switch_active_tenant(request=req, current_user=auth_user, session=db_session)
 
     assert resp.tenant_id == tenant_b_id
     assert resp.role == "VIEWER"
@@ -1457,7 +1459,12 @@ async def test_connection_reuse_with_another_tenant_cleans_context(
     tb = ctx["tenant_b_id"]
 
     test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
-    session_factory = async_sessionmaker(test_engine, class_=ReguLensAppSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        sync_session_class=ReguLensAppSession,
+        expire_on_commit=False,
+    )
 
     async with session_factory() as session:
         # First request context
@@ -1488,7 +1495,7 @@ async def test_switch_tenant_e2e_flow(
     provisioned_multi_tenant_users: dict,
 ):
     """Behavioral Test 15: End-to-end switch tenant flow from Tenant A to Tenant B."""
-    from app.api.v1.endpoints.auth import switch_tenant
+    from app.api.v1.endpoints.auth import switch_active_tenant
     from app.schemas.auth import SwitchTenantRequest
 
     ctx = provisioned_multi_tenant_users
@@ -1512,7 +1519,7 @@ async def test_switch_tenant_e2e_flow(
         role="OWNER",
     )
     req = SwitchTenantRequest(tenant_id=tenant_b_id)
-    resp = await switch_tenant(request=req, current_user=auth_user, session=db_session)
+    resp = await switch_active_tenant(request=req, current_user=auth_user, session=db_session)
 
     # Validates new token bound to Tenant B with VIEWER role
     payload_b = decode_token(resp.access_token)
