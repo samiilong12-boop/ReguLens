@@ -5,8 +5,8 @@ from pydantic import BaseModel
 from fastapi import Depends, HTTPException, status, Header
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.session import async_session_maker, set_tenant_context
-from app.db.models import TenantUser
+from app.db.session import async_session_maker, set_tenant_context, set_user_context
+from app.db.models import Tenant, TenantUser, User
 from app.core.security import decode_token
 from app.core.config import settings
 from app.core.logging import logger
@@ -85,105 +85,81 @@ async def get_current_tenant_id(
     x_tenant_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> UUID:
-    """Resolves and authorizes the active tenant identifier.
+    """Resolves and authorizes the active tenant identifier from the token-bound context.
     
     Security guarantees:
-    1. Authenticates the user first via JWT before processing any tenant claims.
-    2. Never trusts client-supplied X-Tenant-ID without membership verification.
-    3. Fails closed (401 Unauthorized) when unauthenticated, invalid, or expired.
-    4. Fails closed (403 Forbidden) if the user is not an authorized member of the requested tenant.
-    5. Fails closed in production or non-development environments if any dev bypass is attempted.
+    1. Rejects deprecated X-Tenant-ID header with 400 Bad Request to prevent header-spoofing.
+    2. Authenticates the user via JWT bearer token.
+    3. Extracts tenant_id strictly from cryptographically verified token claims.
+    4. Fails closed (401 Unauthorized) when unauthenticated, invalid, or expired.
+    5. Fails closed (400 Bad Request) if token carries no active tenant context.
     """
-    env = (settings.ENVIRONMENT or "").strip().lower()
-
-    # Check for temporary development-only bypass
-    if not authorization or not authorization.startswith("Bearer "):
-        if (
-            env == "development"
-            and settings.ALLOW_DEV_TENANT_BYPASS is True
-            and x_tenant_id
-        ):
-            logger.warning(
-                "dev_tenant_bypass_active",
-                environment=env,
-                message="Allowing unauthenticated X-Tenant-ID header solely due to explicit dev bypass flag.",
-            )
-            try:
-                return UUID(x_tenant_id)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid X-Tenant-ID header format; must be a valid UUID.",
-                )
-
-        # Fail closed for all other cases
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required: Missing or invalid Authorization header.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Authenticate the user
-    user = await get_current_user(authorization=authorization)
-
-    # Determine requested tenant
-    requested_tenant_id: Optional[UUID] = None
-    if x_tenant_id:
-        try:
-            requested_tenant_id = UUID(x_tenant_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid X-Tenant-ID header format; must be a valid UUID.",
-            )
-    elif user.tenant_id:
-        requested_tenant_id = user.tenant_id
-    else:
+    if x_tenant_id is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing tenant context: No active tenant specified in token claims or request headers.",
+            detail=(
+                "The 'X-Tenant-ID' header is deprecated and unsupported on domain endpoints. "
+                "Tenant context is strictly token-bound. "
+                "Please switch tenant via POST /api/v1/auth/switch-tenant."
+            ),
         )
 
-    # Verify tenant membership:
-    # If the token was issued specifically for this tenant, token carries verified membership claim.
-    if user.tenant_id == requested_tenant_id and user.role:
-        return requested_tenant_id
-
-    # Verify in tenant_users table if accessing a different tenant than token's default
-    try:
-        stmt = select(TenantUser).where(
-            TenantUser.user_id == user.id,
-            TenantUser.tenant_id == requested_tenant_id,
-        )
-        result = await db.execute(stmt)
-        membership = result.scalar_one_or_none()
-        if not membership:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Forbidden: User is not an authorized member of the requested tenant.",
-            )
-        return requested_tenant_id
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "tenant_authorization_check_failed",
-            error=str(exc),
-            user_id=str(user.id),
-            tenant_id=str(requested_tenant_id),
-        )
+    user = await get_current_user(authorization=authorization)
+    if not user.tenant_id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden: Unable to verify tenant membership.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing tenant context: No active tenant specified in token claims.",
         )
+    return user.tenant_id
 
 
 async def get_tenant_db(
+    authorization: Optional[str] = Header(None),
     tenant_id: UUID = Depends(get_current_tenant_id),
     db: AsyncSession = Depends(get_db),
 ) -> AsyncGenerator[AsyncSession, None]:
-    """Dependency that sets the transaction-local app.current_tenant_id before yielding the session."""
+    """Dependency that sets the transaction-local app.current_tenant_id and app.current_user_id
+    before yielding the session, after performing real-time status and membership checks."""
+    user = await get_current_user(authorization=authorization)
+
+    # 1. Real-time user account status check (global table, unprivileged SELECT)
+    stmt_user = select(User.is_active).where(User.id == user.id)
+    user_active = (await db.execute(stmt_user)).scalar_one_or_none()
+    if not user_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication failed: User account is deactivated.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 2. Establish transaction-scoped user and tenant context
+    await set_user_context(db, user.id)
     await set_tenant_context(db, tenant_id)
+
+    # 3. Real-time tenant organization status check (RLS on tenants permits reading own row)
+    stmt_tenant = select(Tenant.is_active).where(Tenant.id == tenant_id)
+    tenant_active = (await db.execute(stmt_tenant)).scalar_one_or_none()
+    if not tenant_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Requested tenant organization is inactive or suspended.",
+        )
+
+    # 4. Real-time membership and role check in tenant_users (RLS permits reading under tenant context)
+    stmt_member = select(TenantUser.role).where(
+        TenantUser.tenant_id == tenant_id,
+        TenantUser.user_id == user.id,
+    )
+    current_role = (await db.execute(stmt_member)).scalar_one_or_none()
+    if current_role is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: User is not an active member of this organization.",
+        )
+
+    # Update in-memory user role to live database role
+    user.role = current_role
+
     try:
         yield db
     finally:
