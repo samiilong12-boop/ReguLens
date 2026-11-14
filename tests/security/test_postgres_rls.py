@@ -28,7 +28,8 @@ from typing import AsyncGenerator, Tuple
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 from jose import jwt
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
@@ -1668,3 +1669,257 @@ async def test_domain_endpoint_rejects_x_tenant_id_with_http_400():
 
     assert excinfo.value.status_code == 400
     assert "The 'X-Tenant-ID' header is deprecated" in excinfo.value.detail
+
+
+# ============================================================================
+# FastAPI Dependency Resolution Integration Tests
+# ============================================================================
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def fastapi_auth_test_client() -> AsyncGenerator[AsyncClient, None]:
+    """Provides an ASGI test client for a test-only FastAPI router with genuine dependency resolution.
+    
+    Security Verification:
+    - Exercises real dependency chain: get_current_user -> get_tenant_db -> get_current_tenant_user -> require_owner.
+    - Zero overrides of require_owner, get_current_tenant_user, get_tenant_db, get_current_tenant_id, or get_current_user.
+    - Overrides only get_db (infrastructure database session provider) to bind to DATABASE_TEST_URL
+      using ReguLensAppSession under unprivileged regulens_app role.
+    """
+    from app.db.session import ReguLensAppSession, get_db
+
+    test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
+    test_session_maker = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        sync_session_class=ReguLensAppSession,
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False,
+    )
+
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with test_session_maker() as session:
+            yield session
+
+    test_app = FastAPI()
+    test_app.dependency_overrides[get_db] = override_get_db
+
+    @test_app.get("/api/v1/test/owner-protected")
+    async def owner_protected_endpoint(
+        current_user: CurrentUser = Depends(require_owner),
+    ):
+        return {
+            "status": "success",
+            "user_id": str(current_user.id),
+            "tenant_id": str(current_user.tenant_id),
+            "role": current_user.role,
+        }
+
+    @test_app.get("/api/v1/test/caching-integrity")
+    async def caching_integrity_endpoint(
+        session: AsyncSession = Depends(get_tenant_db),
+        current_user: CurrentUser = Depends(require_owner),
+    ):
+        session_user = session.sync_session.info.get("authorized_user")
+        assert session_user is current_user, "Inconsistent authorized_user across dependencies in single request!"
+        return {
+            "status": "success",
+            "session_id": id(session),
+            "user_id": str(current_user.id),
+            "role": current_user.role,
+        }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app),
+        base_url="http://testserver",
+    ) as client:
+        yield client
+
+    test_app.dependency_overrides.clear()
+    await test_engine.dispose()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_owner_token_with_live_owner_succeeds_200(
+    fastapi_auth_test_client: AsyncClient,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: OWNER token with live database OWNER role succeeds with HTTP 200."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["user_id"] == str(user_1_id)
+    assert data["tenant_id"] == str(tenant_a_id)
+    assert data["role"] == "OWNER"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_owner_token_with_live_demotion_denied_403(
+    fastapi_auth_test_client: AsyncClient,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: OWNER token denied with HTTP 403 after live DB demotion to VIEWER."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    # 1. Demote user in database from OWNER to VIEWER
+    await admin_session.execute(
+        text("UPDATE tenant_users SET role = 'VIEWER' WHERE id = :id"),
+        {"id": str(ctx["m_1_a_id"])},
+    )
+    await admin_session.commit()
+
+    # 2. Present token that still claims OWNER
+    stale_owner_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {stale_owner_token}"},
+    )
+    assert resp.status_code == 403
+    assert "insufficient permissions" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_viewer_token_with_live_viewer_denied_403(
+    fastapi_auth_test_client: AsyncClient,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: VIEWER token with live VIEWER role denied with HTTP 403."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # User 1 is VIEWER in Tenant B
+
+    viewer_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "VIEWER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {viewer_token}"},
+    )
+    assert resp.status_code == 403
+    assert "insufficient permissions" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_viewer_token_with_live_promotion_succeeds_200(
+    fastapi_auth_test_client: AsyncClient,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: VIEWER token succeeds with HTTP 200 after live DB promotion to OWNER."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # Initially VIEWER in Tenant B
+
+    # 1. Promote user from VIEWER to OWNER in database
+    await admin_session.execute(
+        text("UPDATE tenant_users SET role = 'OWNER' WHERE id = :id"),
+        {"id": str(ctx["m_1_b_id"])},
+    )
+    await admin_session.commit()
+
+    # 2. Present token that still claims VIEWER
+    stale_viewer_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "VIEWER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {stale_viewer_token}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["role"] == "OWNER"
+    assert data["user_id"] == str(user_1_id)
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_tampered_jwt_owner_claim_with_live_viewer_denied_403(
+    fastapi_auth_test_client: AsyncClient,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: JWT claiming OWNER denied with HTTP 403 when DB role is VIEWER."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_b_id = ctx["tenant_b_id"]  # In DB, User 1 is VIEWER in Tenant B
+
+    # Forged/tampered token claiming OWNER
+    tampered_token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_b_id), "role": "OWNER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {tampered_token}"},
+    )
+    assert resp.status_code == 403
+    assert "insufficient permissions" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_revoked_membership_denied_403(
+    fastapi_auth_test_client: AsyncClient,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: Token denied with HTTP 403 when membership is revoked in DB."""
+    ctx = provisioned_multi_tenant_users
+    user_3_id = ctx["user_3_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    # 1. Revoke membership in database
+    await admin_session.execute(
+        text("DELETE FROM tenant_users WHERE id = :id"),
+        {"id": str(ctx["m_3_a_id"])},
+    )
+    await admin_session.commit()
+
+    # 2. Present valid token for revoked membership
+    token = create_access_token(
+        data={"sub": str(user_3_id), "tenant_id": str(tenant_a_id), "role": "VIEWER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/owner-protected",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert "not an active member" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_fastapi_dependency_caching_consistent_session(
+    fastapi_auth_test_client: AsyncClient,
+    provisioned_multi_tenant_users: dict,
+):
+    """FastAPI Integration: Dependency caching yields a single consistent session per request."""
+    ctx = provisioned_multi_tenant_users
+    user_1_id = ctx["user_1_id"]
+    tenant_a_id = ctx["tenant_a_id"]
+
+    token = create_access_token(
+        data={"sub": str(user_1_id), "tenant_id": str(tenant_a_id), "role": "OWNER"}
+    )
+    resp = await fastapi_auth_test_client.get(
+        "/api/v1/test/caching-integrity",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["role"] == "OWNER"
+    assert data["user_id"] == str(user_1_id)
+    assert "session_id" in data

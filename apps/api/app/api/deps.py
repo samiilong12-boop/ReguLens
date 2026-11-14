@@ -89,6 +89,7 @@ async def get_current_tenant_id(
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[CurrentUser] = Depends(get_current_user),
 ) -> UUID:
     """Resolves and authorizes the active tenant identifier from the token-bound context.
     
@@ -109,7 +110,11 @@ async def get_current_tenant_id(
             ),
         )
 
-    user = await get_current_user(authorization=authorization)
+    if isinstance(current_user, CurrentUser):
+        user = current_user
+    else:
+        user = await get_current_user(authorization=authorization)
+
     if not user.tenant_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -122,10 +127,14 @@ async def get_tenant_db(
     authorization: Optional[str] = Header(None),
     tenant_id: UUID = Depends(get_current_tenant_id),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[CurrentUser] = Depends(get_current_user),
 ) -> AsyncGenerator[AsyncSession, None]:
     """Dependency that sets the transaction-local app.current_tenant_id and app.current_user_id
     before yielding the session, after performing real-time status and membership checks."""
-    user = await get_current_user(authorization=authorization)
+    if isinstance(current_user, CurrentUser):
+        user = current_user
+    else:
+        user = await get_current_user(authorization=authorization)
 
     # 1. Real-time user account status check (global table, unprivileged SELECT)
     stmt_user = select(User.is_active).where(User.id == user.id)
