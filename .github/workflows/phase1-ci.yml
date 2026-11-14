@@ -172,12 +172,15 @@ jobs:
           print(f'Total Skipped        : {total_skipped}')
           print(f'RLS Skipped          : {rls_skipped}')
 
-          if total_tests == 0:
-              print('CI Quality Gate Violation: Zero tests executed!', file=sys.stderr)
+          min_total_tests = 58
+          min_rls_tests = 17
+
+          if total_tests < min_total_tests:
+              print(f'CI Quality Gate Violation: Executed total tests ({total_tests}) below required minimum ({min_total_tests})!', file=sys.stderr)
               sys.exit(1)
 
-          if rls_tests_found == 0:
-              print('CI Quality Gate Violation: No RLS security tests were executed!', file=sys.stderr)
+          if rls_tests_found < min_rls_tests:
+              print(f'CI Quality Gate Violation: Executed RLS security tests ({rls_tests_found}) below required minimum ({min_rls_tests})!', file=sys.stderr)
               sys.exit(1)
 
           if rls_skipped > 0:
