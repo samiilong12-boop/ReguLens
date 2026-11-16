@@ -1,6 +1,6 @@
 # Phase 1: Minimal Technical Foundation
 
-**Gate 1 Status:** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); test suite expanded to 144 tests (66 unit tests, 26 integration tests, and 52 PostgreSQL 16 RLS security & migration tests); CI configuration disclosure documented; awaiting final founder sign-off.<br>
+**Gate 1 Status:** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); test suite expanded to 152 tests (73 unit tests, 22 integration tests, and 57 PostgreSQL 16 RLS security & migration tests); CI configuration disclosure documented; awaiting final founder sign-off.<br>
 **Entry Condition:** Gate B status is READY FOR FOUNDER SIGN-OFF — final founder review pending.  
 **Read First:** `AGENTS.md`, `.agents/rules/TEAM_WORKFLOW.md`, `.agents/rules/QUALITY_GATES.md`, `phases/ROADMAP.md`, and the approved documents and ADRs from Phase 0B (`docs/PRODUCT_REQUIREMENTS.md`, `docs/SYSTEM_ARCHITECTURE.md`, `docs/DATABASE_SCHEMA.md`, `docs/SECURITY_ARCHITECTURE.md`, `docs/THREAT_MODEL.md`, `docs/TEST_STRATEGY.md`, `docs/adr/0002-multi-tenant-isolation-and-rls.md`, `docs/adr/0008-gcp-compatibility-and-security-preservation.md`). Do the start-of-session check.
 
@@ -30,20 +30,20 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
   - Pluggable storage abstraction (`StorageService` with `MemoryStorageService`, `LocalStorageService`, `S3StorageService`, and `GCSStorageService` per ADR 0008) isolating files by tenant under `tenants/{tenant_id}/quarantine/` and `tenants/{tenant_id}/documents/`.
   - Production fail-closed validation: startup checks reject in-memory/local storage and mock scanners in staging/production, requiring persistent private storage (`s3` or `gcs`) and real scanner (`clamav`).
   - Transport and private bucket controls: SSL strictly required in staging/production (`S3_USE_SSL=True`); insecure `http://` rejected; startup verification validates AWS PublicAccessBlock (all 4 flags True) or GCS Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
-  - Upload-time size enforcement: hard 25MB limit (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`) enforced via S3 presigned POST `content-length-range` condition and direct bounded streaming upload endpoint `POST /api/v1/documents/{id}/upload-content`.
+  - Upload-time size enforcement: hard 25MB limit (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`) enforced via S3 presigned POST `content-length-range` condition; for GCS where signed PUT URLs cannot enforce content-length at provider boundary, `supports_direct_upload = False` and `initiate-upload` directs to authenticated server-mediated bounded streaming upload endpoint `POST /api/v1/documents/{id}/upload-content` with upload-time byte enforcement.
   - Pre-read memory exhaustion protection: finalization queries `get_object_metadata` *before* reading into memory; oversized objects are immediately purged from quarantine without buffering into RAM.
   - Server-side file validation (`file_validation.py`): magic-byte file signature validation (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`) and SHA-256 payload integrity hash verification.
   - Malware scanning subsystem (`scanner.py`): `BaseMalwareScanner`, `ClamAVScanner` connecting via streaming TCP protocol, and `MockMalwareScanner` detecting standard EICAR test string.
   - Fail-safe invariant: scanner errors/timeouts raise `ScannerUnavailableError` (HTTP 503 Service Unavailable), never silently marking unscanned files as clean. Malware detection rejects upload (HTTP 422), purges file from quarantine storage, and sets status to `QUARANTINED`.
   - Secure authenticated download (`GET /api/v1/documents/{id}/download-url`): generates 15-minute presigned download URLs strictly for documents with `status == "AVAILABLE"` and `quarantine_key is None`. Rejects unvalidated or infected files with HTTP 403 Forbidden.
   - Authorized document deletion (`DELETE /api/v1/documents/{id}`): Owner/Admin only; purges object from storage backend and deletes database row.
-  - Quarantine retention & cleanup (`cleanup.py`): automated and CLI pruning (`purge_abandoned_quarantine_objects()`) for abandoned quarantine uploads older than 24 hours, preserving active uploads (< 24 hours).
+  - Quarantine retention & cleanup (`cleanup.py`): tenant-scoped automated and CLI pruning (`purge_abandoned_quarantine_objects()`) for abandoned quarantine uploads older than 24 hours under PostgreSQL RLS and live `OWNER`/`ADMIN` role verification, preserving active uploads (< 24 hours).
   - Sanitized audit logging (`audit.py`): logs document upload, download URL generation, failure, deletion, and cleanup events while automatically redacting presigned URLs, query tokens, and authorization headers.
   - Alembic migration `0004_document_storage_fields.py` adding storage fields, nullable `consignment_id`, `idx_documents_status`, with safe downgrade guard preventing data loss on records with NULL `consignment_id` or `sha256_hash`.
-  - Dedicated PostgreSQL 16 RLS security tests (52 tests total) executing as unprivileged `regulens_app` role (`NOBYPASSRLS`), proving cross-tenant document isolation and append-only audit log protection (UPDATE/DELETE raise SQLSTATE 42501).
+  - Dedicated PostgreSQL 16 RLS security tests (57 tests total) executing as unprivileged `regulens_app` role (`NOBYPASSRLS`), proving cross-tenant document isolation, append-only audit log protection, and tenant-scoped quarantine cleanup isolation.
   - Implemented in `apps/api/app/services/`, `apps/api/app/api/v1/endpoints/documents.py`, `apps/api/alembic/versions/0004_document_storage_fields.py`; preserved in Draft PR #3.
 - **Automated Test Execution:**
-  - 144 total tests passing locally: 66 unit tests, 26 integration tests, 52 PostgreSQL 16 RLS security and migration cycle tests.
+  - 152 total tests passing locally: 73 unit tests, 22 integration tests, 57 PostgreSQL 16 RLS security and migration cycle tests.
   - 100% pass rate with zero skips and zero failures.
 
 ### 1.2. Requirements Not Yet Implemented

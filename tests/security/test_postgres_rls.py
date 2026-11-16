@@ -2339,20 +2339,39 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
         res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         assert res_up.scalar() == "0004_document_storage_fields"
     finally:
-        # Clean up test document
+        # Clean up test document and ensure Alembic state is restored
+        teardown_errors = []
         try:
             await admin_session.rollback()
             await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
             await admin_session.commit()
-        except Exception:
-            await admin_session.rollback()
+
+            # Verify deletion
+            verify_del = await admin_session.execute(text("SELECT count(*) FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test document {test_doc_id}")
+        except Exception as e:
+            teardown_errors.append(f"Error cleaning up test document {test_doc_id}: {e}")
+
         # Ensure at head
         try:
             res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-            if res_check.scalar() != "0004_document_storage_fields":
+            cur_version = res_check.scalar()
+            if cur_version != "0004_document_storage_fields":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-        except Exception:
-            pass
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0004_document_storage_fields":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_with_compatible_records_succeeds: "
+                + "; ".join(teardown_errors)
+            )
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -2411,20 +2430,39 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         assert res.scalar() == "0004_document_storage_fields"
     finally:
-        # Clean up the test NULL row
+        # Clean up the test NULL row and ensure Alembic state is restored
+        teardown_errors = []
         try:
             await admin_session.rollback()
             await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
             await admin_session.commit()
-        except Exception:
-            await admin_session.rollback()
+
+            # Verify deletion
+            verify_del = await admin_session.execute(text("SELECT count(*) FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test NULL document {null_doc_id}")
+        except Exception as e:
+            teardown_errors.append(f"Error cleaning up test NULL document {null_doc_id}: {e}")
+
         # Ensure alembic is restored to head
         try:
             res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-            if res_cur.scalar() != "0004_document_storage_fields":
+            cur_version = res_cur.scalar()
+            if cur_version != "0004_document_storage_fields":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-        except Exception:
-            pass
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0004_document_storage_fields":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_aborts_safely_when_null_rows_present: "
+                + "; ".join(teardown_errors)
+            )
 
 
 # ============================================================================
@@ -2589,3 +2627,349 @@ async def test_postgres_rls_audit_events_tenant_isolated_and_append_only(
         {"id_a": str(audit_a_id), "id_b": str(audit_b_id)},
     )
     await admin_session.commit()
+
+
+# ============================================================================
+# Package C: Tenant-Scoped Quarantine Retention Cleanup RLS Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_tenant_a_cannot_see_or_delete_tenant_b_quarantine_objects(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cleanup cannot see, alter, or delete Tenant B quarantine objects."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in Tenant A, VIEWER in Tenant B
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # 1. Admin seeds an expired unfinalized document for Tenant B (30 hours old)
+    doc_b_id = uuid.uuid4()
+    q_b_key = f"tenants/{tenant_b}/quarantine/{doc_b_id.hex}"
+    storage.put_object(q_b_key, b"tenant_b_secret_quarantine_content")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'b_quarantine.pdf', 1024,
+                'application/pdf', 'tenants/b/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_b_id),
+            "tenant_id": str(tenant_b),
+            "q_key": q_b_key,
+            "created_at": now - timedelta(hours=30),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        # 2. Tenant A OWNER executes cleanup for Tenant A
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        # Scanned and purged counts for Tenant A are 0
+        assert report.scanned_count == 0
+        assert report.purged_count == 0
+        assert doc_b_id not in report.purged_document_ids
+
+        # 3. Tenant B's storage object is untouched
+        assert storage.object_exists(q_b_key) is True
+
+        # 4. Tenant B's database row is completely untouched
+        res_b = await admin_session.execute(
+            text("SELECT status, quarantine_key FROM documents WHERE id = :id"),
+            {"id": str(doc_b_id)},
+        )
+        row_b = res_b.mappings().first()
+        assert row_b is not None
+        assert row_b["status"] == "PENDING_UPLOAD"
+        assert row_b["quarantine_key"] == q_b_key
+
+        # 5. Cross-tenant attempt: User 1 attempts cleanup targeting Tenant B
+        # In Tenant B, User 1 is only a VIEWER -> must fail closed
+        with pytest.raises(PermissionError, match="Requires OWNER or ADMIN role"):
+            await purge_abandoned_quarantine_objects(
+                db=db_session,
+                tenant_id=tenant_b,
+                actor_user_id=user_1_id,
+                storage_service=storage,
+                cutoff_hours=24,
+            )
+    finally:
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_b_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_deletes_only_expired_quarantine_objects(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Tenant cleanup purges expired quarantine objects (>cutoff) and updates status to EXPIRED."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in Tenant A
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # Admin seeds an expired document for Tenant A (36 hours old)
+    doc_a_id = uuid.uuid4()
+    q_a_key = f"tenants/{tenant_a}/quarantine/{doc_a_id.hex}"
+    storage.put_object(q_a_key, b"tenant_a_abandoned_file")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'expired_a.pdf', 2048,
+                'application/pdf', 'tenants/a/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_a_id),
+            "tenant_id": str(tenant_a),
+            "q_key": q_a_key,
+            "created_at": now - timedelta(hours=36),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        # User 1 executes cleanup for Tenant A with 24h cutoff
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        assert report.scanned_count == 1
+        assert report.purged_count == 1
+        assert doc_a_id in report.purged_document_ids
+
+        # Storage object is purged
+        assert storage.object_exists(q_a_key) is False
+
+        # In DB under unprivileged regulens_app with Tenant A context: status is EXPIRED, quarantine_key is NULL
+        await set_tenant_context(db_session, tenant_a)
+        res_a = await db_session.execute(
+            text("SELECT status, quarantine_key, rejection_reason FROM documents WHERE id = :id"),
+            {"id": str(doc_a_id)},
+        )
+        row_a = res_a.mappings().first()
+        assert row_a is not None
+        assert row_a["status"] == "EXPIRED"
+        assert row_a["quarantine_key"] is None
+        assert "abandoned and exceeded the 24-hour retention window" in row_a["rejection_reason"]
+
+        # Immutable audit log was appended
+        audit_res = await db_session.execute(
+            text("""
+                SELECT action, resource_id, details
+                FROM audit_logs
+                WHERE tenant_id = :t_id AND resource_id = :r_id AND action = 'DOCUMENT_QUARANTINE_PURGED'
+            """),
+            {"t_id": str(tenant_a), "r_id": str(doc_a_id)},
+        )
+        audit_row = audit_res.mappings().first()
+        assert audit_row is not None
+        assert audit_row["action"] == "DOCUMENT_QUARANTINE_PURGED"
+    finally:
+        await admin_session.execute(text("DELETE FROM audit_logs WHERE resource_id = :id"), {"id": str(doc_a_id)})
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_a_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_preserves_active_uploads(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Active uploads (< cutoff_hours old) are strictly preserved from deletion."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # Admin seeds an active upload (2 hours old, cutoff is 24 hours)
+    doc_active_id = uuid.uuid4()
+    q_active_key = f"tenants/{tenant_a}/quarantine/{doc_active_id.hex}"
+    storage.put_object(q_active_key, b"tenant_a_active_file")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'active_a.pdf', 1024,
+                'application/pdf', 'tenants/a/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_active_id),
+            "tenant_id": str(tenant_a),
+            "q_key": q_active_key,
+            "created_at": now - timedelta(hours=2),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        assert report.scanned_count == 0
+        assert report.purged_count == 0
+        assert doc_active_id not in report.purged_document_ids
+
+        # Object is preserved in storage
+        assert storage.object_exists(q_active_key) is True
+
+        # Database record remains PENDING_UPLOAD with quarantine_key intact
+        await set_tenant_context(db_session, tenant_a)
+        res_a = await db_session.execute(
+            text("SELECT status, quarantine_key FROM documents WHERE id = :id"),
+            {"id": str(doc_active_id)},
+        )
+        row_a = res_a.mappings().first()
+        assert row_a is not None
+        assert row_a["status"] == "PENDING_UPLOAD"
+        assert row_a["quarantine_key"] == q_active_key
+    finally:
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_active_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_rejected_for_unauthorized_or_viewer_actor(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Cleanup is rejected for unauthorized actors, non-members, deactivated users, or VIEWER role."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    tenant_c = ctx["tenant_c_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in A, VIEWER in B, non-member in C
+    user_3_id = ctx["user_3_id"]  # Deactivated user in A
+    storage = MemoryStorageService()
+
+    # 1. Non-member actor (User 1 targeting Tenant C)
+    with pytest.raises(PermissionError, match="not an active member"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_c,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+        )
+
+    # 2. VIEWER role actor (User 1 targeting Tenant B)
+    with pytest.raises(PermissionError, match="Requires OWNER or ADMIN role"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_b,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+        )
+
+    # 3. Deactivated user (User 3 targeting Tenant A)
+    with pytest.raises(PermissionError, match="account is deactivated"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_3_id,
+            storage_service=storage,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_fails_safely_when_tenant_context_missing(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Safety check: Cleanup fails immediately when tenant_id, actor_user_id, or cutoff_hours are invalid."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    # 1. Missing tenant_id
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=None,
+            actor_user_id=user_1_id,
+        )
+
+    # 2. Missing actor_user_id
+    with pytest.raises(ValueError, match="actor_user_id is required"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=None,
+        )
+
+    # 3. Non-positive cutoff_hours
+    with pytest.raises(ValueError, match="cutoff_hours must be a positive integer"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            cutoff_hours=0,
+        )
+
+    with pytest.raises(ValueError, match="cutoff_hours must be a positive integer"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            cutoff_hours=-12,
+        )

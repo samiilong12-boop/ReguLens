@@ -119,17 +119,17 @@ graph TD
   - Permanent: `tenants/{tenant_id}/documents/{opaque_uuid}`
 - **Upload Size Enforcement & Memory Exhaustion Protection:**
   - Hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
-  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; direct uploads via streaming endpoint `POST /api/v1/documents/{document_id}/upload-content` enforce byte bounds on header and streaming chunks.
+  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; for GCS where signed PUT URLs cannot enforce content-length policies at the provider boundary, `supports_direct_upload = False` and clients are directed to the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`) which enforces byte bounds on Content-Length headers and streaming chunks before writing to quarantine.
   - During finalization, server inspects object metadata (`get_object_metadata`) to verify size *before* reading payload into memory, preventing memory exhaustion (DoS). Oversized objects in quarantine are safely deleted and rejected with HTTP 400.
 - **Two-Phase Upload Lifecycle:**
-  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues a 15-minute presigned upload URL to the quarantine prefix.
-  2. *Client Upload:* Client streams bytes directly to the presigned quarantine URL (or `/upload-content` streaming endpoint).
+  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues an upload transport payload (direct S3 presigned URL or server-mediated `/upload-content` endpoint with 15-minute expiry).
+  2. *Client Upload:* Client streams bytes to the presigned quarantine URL (S3) or server-mediated endpoint (GCS).
   3. *Finalization & Validation (`POST /documents/{id}/finalize-upload`):* Server verifies size from metadata, fetches raw bytes with strict `max_bytes` limit, executes file signature inspection (magic-byte detection for approved MIME types: `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`), and verifies SHA-256 checksum integrity.
   4. *Malware Scanning Subsystem:* Dispatches to `BaseMalwareScanner`:
      - *Clean Scan:* Atomically promotes object from quarantine to permanent storage, purges quarantine object, sets status to `AVAILABLE` and `antivirus_status` to `CLEAN`.
      - *Infected Scan (EICAR / Virus):* Deletes quarantined file immediately, sets status to `REJECTED`, `antivirus_status` to `INFECTED`, records virus signature, and returns HTTP 422.
      - *Scanner Unavailability / Error:* Fails safe with HTTP 503; document remains `QUARANTINED` and is NEVER marked clean or available.
-- **Quarantine Retention & Pruning:** Abandoned quarantine objects older than 24 hours are safely purged by `purge_abandoned_quarantine_objects()` in `apps/api/app/services/cleanup.py`, runnable via CLI (`python -m app.services.cleanup --cutoff-hours 24`), preserving active uploads under 24 hours.
+- **Quarantine Retention & Pruning:** Abandoned quarantine objects older than 24 hours are safely purged by `purge_abandoned_quarantine_objects()` in `apps/api/app/services/cleanup.py`, operating strictly under tenant-scoped PostgreSQL RLS with live role verification (OWNER or ADMIN). Runnable via CLI (`python -m app.services.cleanup --tenant-id <UUID> --actor-user-id <UUID> --cutoff-hours 24`), preserving active uploads under 24 hours.
 - **Secure Download Gate:** Presigned GET URLs (15-min expiry) are generated only for documents where `status == "AVAILABLE"` and `antivirus_status == "CLEAN"`. All unvalidated, quarantined, rejected, or infected documents return HTTP 403 Forbidden.
 - **Audit Logging & Secret Redaction:** Append-only audit records are written on initiation, finalization, download URL generation, deletion, and cleanup events. All presigned URLs, query signatures, tokens, and passwords are sanitized before audit persistence.
 - **Antivirus Engine Disclosure:**

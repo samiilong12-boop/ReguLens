@@ -199,12 +199,13 @@ def test_gcs_storage_service_operations_and_ubla_verification():
     with patch.dict("sys.modules", {"google": MagicMock(cloud=mock_google), "google.cloud": mock_google, "google.cloud.storage": mock_storage}):
         gcs = GCSStorageService(bucket_name="gcs-secure-bucket")
 
-        # 1. Presigned upload & download
-        mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-url"
-        up = gcs.generate_presigned_upload_url("tenants/t1/quarantine/gcs-uuid")
-        assert up.url == "https://storage.googleapis.com/signed-url"
-        assert up.method == "PUT"
+        # 1. Direct presigned uploads disabled for GCS to prevent unrestricted client upload bypass
+        assert gcs.supports_direct_upload is False
+        with pytest.raises(StorageSecurityError, match="Direct presigned uploads are disabled for Google Cloud Storage"):
+            gcs.generate_presigned_upload_url("tenants/t1/quarantine/gcs-uuid")
 
+        # 2. Presigned download remains functional
+        mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-url"
         down = gcs.generate_presigned_download_url("tenants/t1/documents/gcs-uuid")
         assert down.url == "https://storage.googleapis.com/signed-url"
         assert down.method == "GET"

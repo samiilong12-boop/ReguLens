@@ -21,6 +21,7 @@ Exercises all 20 required scenarios through FastAPI ASGI test client:
 18. Document deletion -> storage object purge + audit log.
 19. Non-existent document 404 and invalid consignment handling.
 20. Audit log generation, immutability, and redaction of presigned URLs and secrets.
+21. GCS server-mediated bounded upload rejects oversized payload (>25MB) at upload time.
 """
 from datetime import datetime, timezone
 import hashlib
@@ -1256,3 +1257,88 @@ async def test_listing_documents_with_tenant_isolation_and_filters(
     res_b = await client.get("/api/v1/documents", headers={"Authorization": f"Bearer {token_b}"})
     assert res_b.status_code == 200
     assert res_b.json()["total"] == 0
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_21_gcs_server_mediated_upload_rejects_oversized_payload(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 21: GCS server-mediated bounded upload rejects oversized payload (>25MB) at upload time."""
+    client = document_test_client
+    ctx = document_test_context
+    token_a = ctx["tokens"]["compliance_a"]
+
+    # 1. Configure storage service representing GCS (supports_direct_upload = False)
+    class MockGCSStorageService(MemoryStorageService):
+        @property
+        def supports_direct_upload(self) -> bool:
+            return False
+
+        def generate_presigned_upload_url(self, *args, **kwargs):
+            from app.services.storage import StorageSecurityError
+            raise StorageSecurityError("Direct presigned uploads are disabled for Google Cloud Storage")
+
+    gcs_storage = MockGCSStorageService()
+    set_storage_service(gcs_storage)
+
+    try:
+        # 2. Initiate upload under GCS backend -> returns server_mediated mode
+        init_res = await client.post(
+            "/api/v1/documents/initiate-upload",
+            json={
+                "file_name": "gcs_document.pdf",
+                "expected_size_bytes": len(VALID_PDF_BYTES),
+                "claimed_mime_type": "application/pdf",
+                "document_type": "PHYTOSANITARY_CERTIFICATE",
+            },
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert init_res.status_code == 201, init_res.text
+        init_data = init_res.json()
+        doc_id = init_data["document_id"]
+        assert init_data["upload_mode"] == "server_mediated"
+        assert init_data["upload_method"] == "POST"
+        assert init_data["upload_url"] == f"/api/v1/documents/{doc_id}/upload-content"
+        assert init_data["upload_fields"] is None
+
+        # 3. Client attempts to upload oversized content (> 25MB Content-Length header or body)
+        oversized_headers = {
+            "Authorization": f"Bearer {token_a}",
+            "Content-Type": "application/pdf",
+            "Content-Length": "26214401",  # 25MB + 1 byte
+        }
+        oversized_res = await client.post(
+            f"/api/v1/documents/{doc_id}/upload-content",
+            content=b"%PDF-1.4\n" + b"X" * 100,
+            headers=oversized_headers,
+        )
+        assert oversized_res.status_code == 400
+        assert "exceeds maximum permitted limit" in oversized_res.json()["detail"]
+
+        # 4. Valid upload within 25MB limit succeeds
+        valid_res = await client.post(
+            f"/api/v1/documents/{doc_id}/upload-content",
+            content=VALID_PDF_BYTES,
+            headers={
+                "Authorization": f"Bearer {token_a}",
+                "Content-Type": "application/pdf",
+            },
+        )
+        assert valid_res.status_code == 200
+        valid_data = valid_res.json()
+        assert valid_data["file_size_bytes"] == len(VALID_PDF_BYTES)
+        assert valid_data["status"] == "PENDING_UPLOAD"
+
+        # 5. Finalize upload succeeds and marks document AVAILABLE
+        fin_res = await client.post(
+            f"/api/v1/documents/{doc_id}/finalize-upload",
+            json={"expected_sha256": hashlib.sha256(VALID_PDF_BYTES).hexdigest()},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert fin_res.status_code == 200
+        assert fin_res.json()["status"] == "AVAILABLE"
+
+    finally:
+        # Restore default storage service
+        set_storage_service(ctx["storage"])

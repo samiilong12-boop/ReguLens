@@ -126,7 +126,7 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
      - Server allocates a cryptographically random UUID and stores the file under an isolated quarantine prefix: `tenants/{tenant_id}/quarantine/{uuid}`.
      - Document record is created in the database with status `PENDING_VALIDATION` and `quarantine_key` populated.
      - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds). For S3, presigned POST policy conditions restrict upload size to `[1, 26214400]` bytes.
-     - Alternatively, direct bounded streaming uploads are accepted via `POST /api/v1/documents/{document_id}/upload-content` enforcing the 25MB ceiling on headers and incoming byte chunks.
+     - For GCS, direct presigned uploads are disabled (`supports_direct_upload = False`) because GCS signed PUT URLs cannot enforce upload-time size policies at the provider boundary. GCS uploads use the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`) which enforces the 25MB ceiling on headers and incoming byte chunks before storage writes.
   2. **Phase 2: Upload Finalization & Validation (`POST /api/v1/documents/{id}/finalize-upload`):**
      - Client confirms upload completion with expected SHA-256 hash.
      - **Pre-Read Memory Exhaustion Protection:** The server queries `get_object_metadata` from storage *before* reading the object payload into memory. If the quarantined object exceeds the hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`), the file is immediately purged from quarantine, an audit event is emitted, and HTTP 400 is returned without buffering the oversized object into RAM.
@@ -138,7 +138,8 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
 
 - **Quarantine Retention & Cleanup (`apps/api/app/services/cleanup.py`):**
   - Abandoned quarantine objects older than 24 hours are safely pruned via `purge_abandoned_quarantine_objects()`.
-  - Operator CLI command `python -m app.services.cleanup --cutoff-hours 24` removes orphaned quarantine objects from storage, marks matching database records `FAILED`/`ABANDONED_TIMEOUT`, and records audit entries while preserving active uploads (< 24 hours).
+  - Operates strictly under transaction-scoped PostgreSQL RLS using the unprivileged `regulens_app` role (`NOBYPASSRLS`) with live role verification (requiring `OWNER` or `ADMIN`).
+  - Operator CLI command `python -m app.services.cleanup --tenant-id <TENANT_UUID> --actor-user-id <ACTOR_USER_UUID> --cutoff-hours 24` removes orphaned quarantine objects from storage for the specified tenant, updates matching database records to `status = "EXPIRED"`, and records append-only audit entries while preserving active uploads (< 24 hours).
 
 - **Malware Scanning Subsystem (`scanner.py`):**
   - **Interface:** `BaseMalwareScanner` defining `scan_bytes(data: bytes, filename: str) -> ScanResult`.

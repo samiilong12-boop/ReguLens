@@ -27,7 +27,7 @@ class DocumentUploadInitiateRequest(BaseModel):
 
 
 class DocumentUploadInitiateResponse(BaseModel):
-    """Presigned upload URL and quarantine details."""
+    """Upload endpoint and quarantine details."""
     document_id: UUID
     upload_url: str
     expires_in_seconds: int = 900
@@ -36,6 +36,7 @@ class DocumentUploadInitiateResponse(BaseModel):
     created_at: datetime
     upload_method: str = "PUT"
     upload_fields: Optional[dict] = None
+    upload_mode: str = "direct"  # "direct" (presigned cloud storage) or "server_mediated" (bounded streaming API)
 
 
 class DocumentFinalizeRequest(BaseModel):

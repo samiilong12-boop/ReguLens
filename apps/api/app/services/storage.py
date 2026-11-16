@@ -75,6 +75,11 @@ def generate_tenant_object_key(tenant_id: UUID, is_quarantine: bool = False) -> 
 class StorageService(ABC):
     """Abstract provider-independent storage interface."""
 
+    @property
+    def supports_direct_upload(self) -> bool:
+        """Indicates whether this storage backend supports genuine provider-level upload-time size enforcement."""
+        return True
+
     @abstractmethod
     def generate_presigned_upload_url(
         self,
@@ -625,6 +630,14 @@ class GCSStorageService(StorageService):
                 self._client = storage.Client(project=self.project_id)
         return self._client
 
+    @property
+    def supports_direct_upload(self) -> bool:
+        """GCS signed PUT URLs cannot enforce content-length-range policies at the upload boundary.
+        Direct presigned uploads are disabled for GCS in favor of the authenticated server-mediated
+        bounded streaming upload endpoint (/upload-content) which strictly enforces the 25MB ceiling.
+        """
+        return False
+
     def generate_presigned_upload_url(
         self,
         object_key: str,
@@ -632,24 +645,10 @@ class GCSStorageService(StorageService):
         content_type: Optional[str] = None,
         max_size_bytes: int = 25 * 1024 * 1024,
     ) -> PresignedUrlInfo:
-        client = self._get_client()
-        bucket = client.bucket(self.bucket_name)
-        blob = bucket.blob(object_key)
-        headers = {}
-        if content_type:
-            headers["Content-Type"] = content_type
-
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(seconds=expires_in_seconds),
-            method="PUT",
-            content_type=content_type,
-        )
-        return PresignedUrlInfo(
-            url=url,
-            expires_in_seconds=expires_in_seconds,
-            method="PUT",
-            headers=headers,
+        raise StorageSecurityError(
+            "Direct presigned uploads are disabled for Google Cloud Storage because GCS signed PUT URLs "
+            "cannot enforce maximum upload size at the provider boundary. Use the authenticated server-mediated "
+            "bounded upload endpoint (/upload-content) to enforce the 25MB upload limit."
         )
 
     def generate_presigned_download_url(

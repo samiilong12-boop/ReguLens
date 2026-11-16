@@ -96,13 +96,26 @@ async def initiate_upload(
     db.add(document)
     await db.flush()
 
-    # Generate presigned upload URL (15-min expiry)
-    presigned = storage_service.generate_presigned_upload_url(
-        object_key=quarantine_key,
-        expires_in_seconds=900,
-        content_type=payload.claimed_mime_type,
-        max_size_bytes=min(payload.expected_size_bytes, settings.MAX_DOCUMENT_SIZE_BYTES),
-    )
+    # Generate upload transport configuration based on backend capabilities
+    if not storage_service.supports_direct_upload:
+        # Bounded server-mediated upload endpoint (e.g. for GCS where signed PUT lacks provider content-length-range)
+        upload_mode = "server_mediated"
+        upload_url = f"/api/v1/documents/{document.id}/upload-content"
+        upload_method = "POST"
+        upload_fields = None
+        expires_in = 900
+    else:
+        presigned = storage_service.generate_presigned_upload_url(
+            object_key=quarantine_key,
+            expires_in_seconds=900,
+            content_type=payload.claimed_mime_type,
+            max_size_bytes=min(payload.expected_size_bytes, settings.MAX_DOCUMENT_SIZE_BYTES),
+        )
+        upload_mode = "direct"
+        upload_url = presigned.url
+        upload_method = presigned.method
+        upload_fields = presigned.fields or None
+        expires_in = presigned.expires_in_seconds
 
     # Log immutable audit event
     ip = request.client.host if request.client else None
@@ -119,8 +132,9 @@ async def initiate_upload(
             "claimed_mime_type": payload.claimed_mime_type,
             "document_type": payload.document_type,
             "consignment_id": str(payload.consignment_id) if payload.consignment_id else None,
-            "expires_in_seconds": presigned.expires_in_seconds,
-            "upload_method": presigned.method,
+            "expires_in_seconds": expires_in,
+            "upload_method": upload_method,
+            "upload_mode": upload_mode,
         },
         ip_address=ip,
         user_agent=ua,
@@ -131,13 +145,14 @@ async def initiate_upload(
 
     return DocumentUploadInitiateResponse(
         document_id=document.id,
-        upload_url=presigned.url,
-        expires_in_seconds=presigned.expires_in_seconds,
+        upload_url=upload_url,
+        expires_in_seconds=expires_in,
         quarantine_key=quarantine_key,
         status=document.status,
         created_at=document.created_at,
-        upload_method=presigned.method,
-        upload_fields=presigned.fields or None,
+        upload_method=upload_method,
+        upload_fields=upload_fields,
+        upload_mode=upload_mode,
     )
 
 
