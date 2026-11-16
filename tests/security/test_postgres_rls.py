@@ -2340,12 +2340,19 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
         assert res_up.scalar() == "0004_document_storage_fields"
     finally:
         # Clean up test document
-        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
-        await admin_session.commit()
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
+            await admin_session.commit()
+        except Exception:
+            await admin_session.rollback()
         # Ensure at head
-        res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-        if res_check.scalar() != "0004_document_storage_fields":
-            await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        try:
+            res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            if res_check.scalar() != "0004_document_storage_fields":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        except Exception:
+            pass
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -2405,8 +2412,19 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
         assert res.scalar() == "0004_document_storage_fields"
     finally:
         # Clean up the test NULL row
-        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
-        await admin_session.commit()
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
+            await admin_session.commit()
+        except Exception:
+            await admin_session.rollback()
+        # Ensure alembic is restored to head
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            if res_cur.scalar() != "0004_document_storage_fields":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        except Exception:
+            pass
 
 
 # ============================================================================

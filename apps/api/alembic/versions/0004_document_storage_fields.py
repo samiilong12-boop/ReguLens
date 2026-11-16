@@ -72,6 +72,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Temporarily remove FORCE ROW LEVEL SECURITY for the migration role (table owner)
+    # so that data consistency pre-checks can scan all tenant records.
+    # Note: ENABLE ROW LEVEL SECURITY remains in force; unprivileged application users
+    # (regulens_app) remain 100% subject to RLS policies.
+    op.execute("ALTER TABLE documents NO FORCE ROW LEVEL SECURITY;")
+
     # Pre-downgrade check: prevent silent data corruption or loss when records contain NULL values
     bind = op.get_bind()
     null_consignments = bind.execute(
@@ -114,3 +120,6 @@ def downgrade() -> None:
         existing_type=postgresql.UUID(as_uuid=True),
         nullable=False,
     )
+
+    # 4. Re-apply FORCE ROW LEVEL SECURITY to maintain strict isolation
+    op.execute("ALTER TABLE documents FORCE ROW LEVEL SECURITY;")
