@@ -103,17 +103,53 @@ Every API endpoint enforces:
   ```
   Scoping to the transaction (`is_local = true`) guarantees that when connections return to a connection pool (PgBouncer), the context is automatically cleared.
 
-### 3.4. File & Object Storage Security
+### 3.4. File & Object Storage Security (Package C Implementation)
 Exporters upload sensitive commercial invoices, lab reports, and customs documents across both agriculture and apparel sectors.
-- **Private Buckets:** Object storage buckets (S3 / MinIO) have public access entirely blocked (`BlockPublicAcls = true`, `BlockPublicPolicy = true`).
-- **Temporary Signed URLs:** Documents are viewed exclusively through server-generated signed URLs with an expiration lifetime of **15 minutes**.
-- **Upload Validation Pipeline:**
-  1. **Magic-Byte Inspection:** File headers are validated on the server using `python-magic` to confirm that declared MIME types match actual binary content (e.g. verifying a `.pdf` file starts with `%PDF-`).
-  2. **Strict File Size Limits:** Maximum upload size hard-capped at **25 MB** per document.
-  3. **Randomized Storage Keys:** Files are saved using UUID-based or SHA-256 hash paths (`tenants/{tenant_id}/docs/{uuid}_{hash}.pdf`), preventing path traversal.
-  4. **Antivirus Scanning Status:**
-     - *Production Specification:* Asynchronous ClamAV container scanning uploaded streams before parsing.
-     - *Development Limitation Notice:* In local developer environments without Docker, ClamAV is not installed. Safe parsing in an unprivileged process and strict magic-byte validation are enforced locally. Magic-byte checking is NOT claimed to be equivalent to antivirus scanning.
+
+- **Pluggable Storage Abstraction:**
+  The `StorageService` interface (`apps/api/app/services/storage.py`) provides backend-agnostic storage operations with concrete implementations:
+  - `MemoryStorageService`: In-memory dictionary storage for fast, isolated unit and integration testing.
+  - `LocalStorageService`: Filesystem storage for local development environments.
+  - `S3StorageService`: AWS S3 / MinIO / GCS S3-compatible cloud object storage with public access completely blocked (`BlockPublicAcls = true`, `BlockPublicPolicy = true`).
+
+- **Two-Phase Upload Lifecycle & Quarantine Isolation:**
+  Direct arbitrary uploads to permanent document paths are strictly prevented:
+  1. **Phase 1: Upload Initiation (`POST /api/v1/documents/initiate-upload`):**
+     - Client requests an upload slot with metadata (filename, declared MIME type, optional consignment reference).
+     - System validates declared MIME type against allowed whitelist (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`).
+     - Server allocates a cryptographically random UUID and stores the file under an isolated quarantine prefix: `tenants/{tenant_id}/quarantine/{uuid}`.
+     - Document record is created in the database with status `PENDING_VALIDATION` and `quarantine_key` populated.
+     - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds).
+  2. **Phase 2: Upload Finalization & Validation (`POST /api/v1/documents/{id}/finalize-upload`):**
+     - Client confirms upload completion with expected SHA-256 hash.
+     - Server retrieves the uploaded object from quarantine storage.
+     - **File Size Verification:** Payload is inspected to ensure it does not exceed the hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
+     - **Magic-Byte Signature Verification:** Server inspects the binary header bytes (`file_validation.py`) to confirm actual content matches declared MIME type (e.g. `%PDF-` for PDF, `\x89PNG\r\n\x1a\n` for PNG, `\xff\xd8\xff` for JPEG, `II*\x00` or `MM\x00*` for TIFF). Mismatched magic bytes immediately reject the file (HTTP 400).
+     - **SHA-256 Checksum Verification:** Server computes the SHA-256 hash of the payload and verifies it against client-provided hash (HTTP 400 on mismatch).
+     - **Malware Scanning:** Payload is passed to the malware scanner subsystem.
+     - **Atomic Promotion:** Upon passing all checks, the object is copied/moved to permanent storage at `tenants/{tenant_id}/documents/{uuid}`, the quarantine object is deleted, `quarantine_key` is cleared (`None`), document status is updated to `AVAILABLE`, and `validated_at` timestamp is set.
+
+- **Malware Scanning Subsystem (`scanner.py`):**
+  - **Interface:** `BaseMalwareScanner` defining `scan_bytes(data: bytes, filename: str) -> ScanResult`.
+  - **Fail-Safe Invariant:** If the malware scanner is unreachable, times out, or encounters an internal socket error, it raises `ScannerUnavailableError` resulting in **HTTP 503 Service Unavailable**. The system **NEVER** silently marks an unscanned file as clean.
+  - **ClamAV Integration:** `ClamAVScanner` communicates with ClamAV daemon via TCP socket using the `zINSTREAM\0` streaming protocol. Configurable via `CLAMAV_HOST`, `CLAMAV_PORT`, and `CLAMAV_TIMEOUT_SECONDS`.
+  - **Mock Scanner:** `MockMalwareScanner` for test environments detects standard EICAR test strings (`X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`).
+  - **Infection Handling:** If malware is detected, the upload is rejected with **HTTP 422 Unprocessable Content**, the file is immediately purged from quarantine storage, and the database record is updated to `status = "QUARANTINED"` with `rejection_reason = "Malware detected: {threat_name}"`.
+
+- **Secure Download & Access Control (`GET /api/v1/documents/{id}/download-url`):**
+  - Direct public access to storage is impossible.
+  - Exporters and reviewers access documents exclusively via server-generated signed download URLs with a **15-minute** expiry.
+  - Signed download URLs are issued **strictly** for documents with `status == "AVAILABLE"` and `quarantine_key is None`.
+  - Attempting to download or generate a URL for unvalidated (`PENDING_VALIDATION`) or infected (`QUARANTINED`, `FAILED`) files is blocked with **HTTP 403 Forbidden**.
+
+- **Authorized Document Deletion (`DELETE /api/v1/documents/{id}`):**
+  - Restricted to authenticated users with `OWNER` or `ADMIN` roles in the tenant.
+  - The permanent storage object is purged from the storage backend.
+  - The document record is removed from the database, and an immutable audit log is generated.
+
+- **Sanitized Audit Trail:**
+  - All file lifecycle events (`DOCUMENT_UPLOAD_INITIATED`, `DOCUMENT_UPLOAD_FINALIZED`, `DOCUMENT_UPLOAD_FAILED`, `DOCUMENT_DOWNLOAD_URL_GENERATED`, `DOCUMENT_DELETED`) are emitted to `audit_logs`.
+  - Presigned URLs, query tokens, and authorization headers are automatically redacted prior to log persistence.
 
 ### 3.5. AI & Prompt Boundary Security
 Per `AGENTS.md` Rule 6:

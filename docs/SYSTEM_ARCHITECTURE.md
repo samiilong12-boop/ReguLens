@@ -1,9 +1,17 @@
 # ReguLens — System Architecture Document (Multi-Sector Corrected)
 
 ## Document Status
-- **Current Phase:** Phase 1 — Minimal Technical Foundation
-- **Strategic Scope:** Multi-Sector Architecture supporting both **Sector 1 (Agriculture & Agri-food)** and **Sector 2 (Textiles & Apparel)**
-- **Provisional Test Case:** Fresh Egyptian Valencia Oranges (CN `0805 10 00`) to EU serves strictly as a provisional engineering test case for early validation.
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Package A & Package B complete in Draft PRs; Package C pending)
+- **Strategic Scope:** Multi-Sector Architecture supporting both **Sector 1 (Agriculture & Agri-food)** and **Sector 2 (Textiles & Apparel)** as the long-term platform vision.
+- **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Formally approved by the founder as the first vertical slice to prove end-to-end multi-regime regulatory discovery, gap analysis, and dossier compilation. The multi-sector strategy is preserved as the strategic expansion path for Phase 3 and beyond, subject to exporter validation and trade data.
+- **Approved Acceptance Targets (Targets Approved by Founder; NOT Achieved Results):**
+  - Citation Validity: 100%
+  - Citation Support: ≥98%
+  - Requirement Extraction Precision: ≥95%
+  - Requirement Extraction Recall: ≥95%
+  - Unsupported-Claim Rate: 0%
+  - Source Freshness: 100% within defined thresholds, otherwise a visible degraded-status warning.
+  - Golden Dataset: 25 curated, human-verified test cases.
 - **Architectural Principle:** Minimal Technology (`AGENTS.md` Rule 15 & `QUALITY_GATES.md` Section 5)
 - **Security Boundary Notice:** PostgreSQL Row Level Security (RLS) is an additional database-engine authorization boundary, NOT cryptographic tenant isolation.
 
@@ -97,10 +105,24 @@ graph TD
 
 ---
 
-## 5. Security & Antivirus Status Disclosure
+## 5. Secure Document Storage & Upload Pipeline (Package C)
 
-- **Storage Security:** 100% private S3 buckets; zero public URLs. Access granted exclusively via short-lived signed URLs (15 minutes).
-- **Upload Validation:** Server-side magic-byte inspection (`python-magic`), 25MB file size limits, and randomized storage keys.
-- **Antivirus Status:**
-  - *Production Target:* ClamAV container daemon scanning uploaded streams before parsing.
-  - *Development Limitation Notice:* In local developer environments without Docker, ClamAV is not installed. Safe parsing in an unprivileged process and strict magic-byte validation are enforced locally. Magic-byte checking is NOT claimed to be equivalent to antivirus scanning.
+- **Storage Abstraction:** Provider-independent `StorageService` interface implemented across `MemoryStorageService` (in-memory testing), `LocalStorageService` (development filesystem with path-traversal protection), and `S3StorageService` (production S3/GCS-compatible private bucket).
+- **Private Storage Invariant:** 100% private bucket; zero public ACLs or public URLs. All client upload and download access operates exclusively through short-lived presigned URLs (15-minute expiry).
+- **Opaque Key Strategy:** User-supplied filenames are never used in object storage paths. Keys are strictly randomized and tenant-partitioned:
+  - Quarantine: `tenants/{tenant_id}/quarantine/{opaque_uuid}`
+  - Permanent: `tenants/{tenant_id}/documents/{opaque_uuid}`
+- **Two-Phase Upload Lifecycle:**
+  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues a 15-minute presigned PUT URL to the quarantine prefix.
+  2. *Client Upload:* Client streams bytes directly to the presigned quarantine URL.
+  3. *Finalization & Validation (`POST /documents/{id}/finalize-upload`):* Server fetches raw bytes from quarantine, enforces size ceiling (≤ 25MB), executes file signature inspection (magic-byte detection for approved MIME types: `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`), and verifies SHA-256 checksum integrity.
+  4. *Malware Scanning Subsystem:* Dispatches to `BaseMalwareScanner`:
+     - *Clean Scan:* Atomically promotes object from quarantine to permanent storage, purges quarantine object, sets status to `AVAILABLE` and `antivirus_status` to `CLEAN`.
+     - *Infected Scan (EICAR / Virus):* Deletes quarantined file immediately, sets status to `REJECTED`, `antivirus_status` to `INFECTED`, records virus signature, and returns HTTP 422.
+     - *Scanner Unavailability / Error:* Fails safe with HTTP 503; document remains `QUARANTINED` and is NEVER marked clean or available.
+- **Secure Download Gate:** Presigned GET URLs (15-min expiry) are generated only for documents where `status == "AVAILABLE"` and `antivirus_status == "CLEAN"`. All unvalidated, quarantined, rejected, or infected documents return HTTP 403 Forbidden.
+- **Audit Logging & Secret Redaction:** Append-only audit records are written on initiation, finalization, download URL generation, and deletion. All presigned URLs, query signatures, tokens, and passwords are sanitized before audit persistence.
+- **Antivirus Engine Disclosure:**
+  - *Production Target:* `ClamAVScanner` connecting over TCP (`zINSTREAM` protocol) with fail-closed timeout and connection error handling.
+  - *Testing / CI Engine:* `MockMalwareScanner` with built-in EICAR antivirus test signature detection and configurable failure simulation.
+  - *Local Development Notice:* Magic-byte checking is NOT claimed to be equivalent to antivirus scanning. Live ClamAV daemon connectivity is required for production certification.

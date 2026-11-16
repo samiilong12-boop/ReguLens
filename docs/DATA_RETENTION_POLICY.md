@@ -30,6 +30,21 @@ Data within ReguLens is categorized into six distinct classifications, each with
 
 ---
 
+### 2.1. Document Quarantine & Upload Lifecycle Retention (Package C)
+
+1. **Presigned Upload URL Expiry:**
+   Presigned upload URLs expire after **15 minutes** (900 seconds). If upload is not initiated within this window, the client must request a new upload slot.
+2. **Quarantine Storage Lifecycle & Purge:**
+   - **Immediate Purge on Validation Failure:** Files failing magic-byte MIME validation, SHA-256 integrity verification, or file size limits (25MB) are purged from quarantine storage (`tenants/{tenant_id}/quarantine/{uuid}`) immediately during finalization.
+   - **Immediate Purge on Malware Detection:** If ClamAV detects malware, the payload is purged immediately from quarantine storage to prevent malware persistence.
+   - **Unfinalized Abandoned Uploads:** Any orphaned objects in quarantine storage not finalized within 24 hours are pruned by background retention jobs.
+3. **Infected & Rejected Document Metadata Record:**
+   - While the infectious file payload is purged immediately, the document metadata record in the database is retained with `status = "QUARANTINED"` (or `"REJECTED"`) and `rejection_reason` populated. This ensures security and forensic non-repudiation while eliminating payload risk.
+4. **Authorized Document Deletion:**
+   - When an authorized user (`Owner` or `Admin`) deletes a document via `DELETE /api/v1/documents/{id}`, the storage object at `tenants/{tenant_id}/documents/{uuid}` is permanently purged from storage, the database record is removed, and a `DOCUMENT_DELETED` audit event is written to `audit_logs`.
+
+---
+
 ## 3. Tenant Offboarding & Right to Erasure
 
 ### 3.1. Tenant Termination Workflow

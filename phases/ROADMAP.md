@@ -15,7 +15,7 @@ This file is the only place that defines phase order. `docs/DEVELOPMENT_ROADMAP.
 Phase 1 and later phase files are written after Gate B from `phases/PHASE_TEMPLATE.md`, because they depend on the approved architecture. `API_SPECIFICATION.md` is written at the start of Phase 2.
 
 ## The Vertical Slice (Phase 2)
-One product and one market from the approved scope. The slice must prove the core claim: ReguLens can take a real product, derive its requirements from official sources, check its documents, and show gaps reliably.
+One product and one market from the approved scope: **Fresh Egyptian Valencia oranges exported to the European Union (EU-27)** (CN code 0805 10 00). The slice must prove the core claim: ReguLens can take a real product, derive its requirements from official sources, check its documents, and show gaps reliably. The broader multi-sector strategy remains the expansion direction for Phase 3 and later.
 
 Journey: create organization, add product, select destination market and confirm product characteristics, retrieve requirements supported by official sources, review each source and its verification date and lifecycle state, upload documents, run document and gap analysis, review missing information, generate a versioned PDF report.
 

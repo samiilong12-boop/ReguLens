@@ -266,6 +266,7 @@ async def provisioned_hierarchy(
         mime_type="application/pdf",
         storage_key=f"tenants/{tenant_a}/docs/phyto_a.pdf",
         sha256_hash="a" * 64,
+        status="AVAILABLE",
         antivirus_status="CLEAN",
         parsing_status="PARSED",
     )
@@ -279,6 +280,7 @@ async def provisioned_hierarchy(
         mime_type="application/pdf",
         storage_key=f"tenants/{tenant_b}/docs/phyto_b.pdf",
         sha256_hash="b" * 64,
+        status="AVAILABLE",
         antivirus_status="CLEAN",
         parsing_status="PARSED",
     )
@@ -1968,9 +1970,13 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
     alembic_cfg.set_main_option("script_location", str(alembic_dir))
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
-    # 1. Verify initial head precondition
+    # 1. Verify initial head precondition (ensuring starting at 0003 for this test)
     res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
     initial_version = res.scalar()
+    if initial_version == "0004_document_storage_fields":
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        initial_version = res.scalar()
     assert initial_version == "0003_membership_rls_policies", (
         f"Precondition failed: Expected 0003_membership_rls_policies, got {initial_version}"
     )
@@ -2042,10 +2048,10 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         t_down = policies_down["rls_tenants"]
         assert "nullif" in t_down.qual.lower(), "Restored rls_tenants missing NULLIF in qual"
 
-        # 6. Execute alembic upgrade head
+        # 6. Execute alembic upgrade to 0003
         # Commit session before running upgrade to ensure idle state
         await admin_session.commit()
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0003_membership_rls_policies")
 
         # 7. Verify expected Alembic revision after upgrade
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
@@ -2141,11 +2147,130 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         except Exception:
             await admin_session.rollback()
 
-        # Ensure alembic is at head if anything failed mid-downgrade
+        # Ensure alembic is restored to head
         try:
-            res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-            cur_ver = res.scalar()
-            if cur_ver != "0003_membership_rls_policies":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        except Exception:
+            pass
+
+
+# ============================================================================
+# Migration 0004 Downgrade & Upgrade Lifecycle Verification Gate
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSession):
+    """Behavioral Gate: Alembic downgrade to 0003 and upgrade to 0004 cycle against PostgreSQL 16.
+
+    Verifies:
+    1. Precondition: Starts from Package C migration head (0004_document_storage_fields).
+    2. Verifies Package C columns and index exist on documents table.
+    3. Downgrades cleanly to 0003_membership_rls_policies.
+    4. Verifies Package C columns and index are dropped.
+    5. Re-upgrades to 0004_document_storage_fields / head.
+    6. Verifies Package C columns and index are restored.
+    """
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+    from app.core.config import settings
+
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+    settings.DATABASE_MIGRATION_URL = migration_url
+    os.environ["DATABASE_MIGRATION_URL"] = migration_url
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # 1. Ensure at 0004 head
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    assert res.scalar() == "0004_document_storage_fields"
+
+    # 2. Verify columns exist in 0004
+    col_res = await admin_session.execute(text("""
+        SELECT column_name, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'documents';
+    """))
+    cols_0004 = {row.column_name: row.is_nullable for row in col_res.fetchall()}
+    assert "status" in cols_0004
+    assert "quarantine_key" in cols_0004
+    assert "uploaded_by_user_id" in cols_0004
+    assert "rejection_reason" in cols_0004
+    assert "validated_at" in cols_0004
+    assert cols_0004["consignment_id"] == "YES"
+    assert cols_0004["sha256_hash"] == "YES"
+
+    # Verify index exists
+    idx_res = await admin_session.execute(text("""
+        SELECT indexname FROM pg_indexes
+        WHERE schemaname = 'public' AND tablename = 'documents' AND indexname = 'idx_documents_status';
+    """))
+    assert idx_res.scalar() == "idx_documents_status"
+
+    try:
+        # 3. Downgrade to 0003
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res_down = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_down.scalar() == "0003_membership_rls_policies"
+
+        # Verify columns removed
+        col_down = await admin_session.execute(text("""
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'documents';
+        """))
+        cols_0003 = {row.column_name: row.is_nullable for row in col_down.fetchall()}
+        assert "status" not in cols_0003
+        assert "quarantine_key" not in cols_0003
+        assert "uploaded_by_user_id" not in cols_0003
+        assert "rejection_reason" not in cols_0003
+        assert "validated_at" not in cols_0003
+        assert cols_0003["consignment_id"] == "NO"
+        assert cols_0003["sha256_hash"] == "NO"
+
+        # Verify index dropped
+        idx_down = await admin_session.execute(text("""
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'documents' AND indexname = 'idx_documents_status';
+        """))
+        assert idx_down.scalar() is None
+
+        # 4. Re-upgrade to head (0004)
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0004_document_storage_fields"
+
+        # Verify columns restored
+        col_up = await admin_session.execute(text("""
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'documents';
+        """))
+        cols_restored = {row.column_name: row.is_nullable for row in col_up.fetchall()}
+        assert "status" in cols_restored
+        assert "quarantine_key" in cols_restored
+        assert "uploaded_by_user_id" in cols_restored
+        assert "rejection_reason" in cols_restored
+        assert "validated_at" in cols_restored
+        assert cols_restored["consignment_id"] == "YES"
+        assert cols_restored["sha256_hash"] == "YES"
+
+    finally:
+        # Restore to head
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            if res_cur.scalar() != "0004_document_storage_fields":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
         except Exception:
             pass

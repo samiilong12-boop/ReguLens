@@ -50,13 +50,23 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # Object Storage
+    # Object Storage & Upload Security (Package C)
+    STORAGE_BACKEND: str = Field(default="memory")  # "memory", "local", "s3"
+    LOCAL_STORAGE_PATH: str = Field(default="./data/storage")
     S3_ENDPOINT_URL: str = "http://localhost:9000"
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
     S3_BUCKET_NAME: str = "regulens-documents"
     S3_REGION: str = "us-east-1"
     S3_USE_SSL: bool = False
+    MAX_DOCUMENT_SIZE_BYTES: int = 25 * 1024 * 1024  # 25 MB strict limit
+    PRESIGNED_URL_EXPIRE_SECONDS: int = 900  # 15 minutes strict expiry
+
+    # Malware Scanner Configuration (Package C)
+    MALWARE_SCANNER_TYPE: str = Field(default="mock")  # "mock", "clamav"
+    CLAMAV_HOST: str = "localhost"
+    CLAMAV_PORT: int = 3310
+    CLAMAV_TIMEOUT_SECONDS: float = 5.0
 
     # AI Integration Boundary
     AI_PROVIDER: str = "gemini"
