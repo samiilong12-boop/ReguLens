@@ -422,12 +422,14 @@ async def test_scenario_04_rejection_of_file_exceeding_25mb(
     document_test_client: AsyncClient,
     document_test_context: dict,
 ):
-    """Scenario 4: Rejection of files exceeding 25MB limit."""
+    """Scenario 4: Rejection of files exceeding 25MB limit across initiate, stream upload, and finalize."""
     token = document_test_context["tokens"]["compliance_a"]
+    client = document_test_client
+    storage = document_test_context["storage"]
 
-    # Client claims file size > 25MB in initiate request
+    # 1. Client claims file size > 25MB in initiate request -> rejected with 422
     oversized = 25 * 1024 * 1024 + 1
-    resp = await document_test_client.post(
+    resp = await client.post(
         "/api/v1/documents/initiate-upload",
         json={
             "file_name": "huge.pdf",
@@ -438,6 +440,58 @@ async def test_scenario_04_rejection_of_file_exceeding_25mb(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 422
+
+    # 2. Client initiates with valid size, but actual quarantine metadata exceeds 25MB
+    valid_init = await client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "sneaky_huge.pdf",
+            "expected_size_bytes": 1024,
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PACKING_LIST",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert valid_init.status_code == 201
+    doc_id = valid_init.json()["document_id"]
+    q_key = valid_init.json()["quarantine_key"]
+
+    # Place oversized metadata object in quarantine
+    storage._objects[q_key] = (b"%PDF-" + b"0" * (25 * 1024 * 1024 + 50), "application/pdf", datetime.now(timezone.utc))
+
+    fin_res = await client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert fin_res.status_code == 400
+    assert "exceeds maximum permitted limit" in fin_res.json()["detail"]
+    # Oversized payload must be purged from quarantine
+    assert not storage.object_exists(q_key)
+
+    # 3. Direct bounded streaming upload with Content-Length > 25MB is rejected
+    stream_init = await client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "stream_huge.pdf",
+            "expected_size_bytes": 1024,
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PACKING_LIST",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert stream_init.status_code == 201
+    stream_doc_id = stream_init.json()["document_id"]
+
+    stream_res = await client.post(
+        f"/api/v1/documents/{stream_doc_id}/upload-content",
+        content=b"some bytes",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Length": str(25 * 1024 * 1024 + 100),
+        },
+    )
+    assert stream_res.status_code == 400
+    assert "exceeds maximum permitted limit" in stream_res.json()["detail"]
 
 
 @pytest.mark.asyncio(loop_scope="function")

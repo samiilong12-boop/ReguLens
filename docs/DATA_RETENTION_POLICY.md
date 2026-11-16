@@ -37,7 +37,11 @@ Data within ReguLens is categorized into six distinct classifications, each with
 2. **Quarantine Storage Lifecycle & Purge:**
    - **Immediate Purge on Validation Failure:** Files failing magic-byte MIME validation, SHA-256 integrity verification, or file size limits (25MB) are purged from quarantine storage (`tenants/{tenant_id}/quarantine/{uuid}`) immediately during finalization.
    - **Immediate Purge on Malware Detection:** If ClamAV detects malware, the payload is purged immediately from quarantine storage to prevent malware persistence.
-   - **Unfinalized Abandoned Uploads:** Any orphaned objects in quarantine storage not finalized within 24 hours are pruned by background retention jobs.
+   - **Unfinalized Abandoned Uploads:** Any orphaned objects in quarantine storage not finalized within 24 hours are pruned by background retention cleanup jobs. Operators can trigger this process via `apps/api/app/services/cleanup.py` (`purge_abandoned_quarantine_objects()`) or via the command line:
+     ```bash
+     python -m app.services.cleanup --cutoff-hours 24
+     ```
+     This safely deletes unfinalized quarantine objects older than 24 hours from storage, updates matching database rows to `FAILED` with failure reason `ABANDONED_TIMEOUT`, and records audit entries while preserving active uploads (< 24 hours).
 3. **Infected & Rejected Document Metadata Record:**
    - While the infectious file payload is purged immediately, the document metadata record in the database is retained with `status = "QUARANTINED"` (or `"REJECTED"`) and `rejection_reason` populated. This ensures security and forensic non-repudiation while eliminating payload risk.
 4. **Authorized Document Deletion:**

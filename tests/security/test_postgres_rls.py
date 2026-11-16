@@ -2274,3 +2274,300 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
         except Exception:
             pass
+
+
+# ============================================================================
+# Migration 0004 Data-Bearing Downgrade & Upgrade Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_with_compatible_records_succeeds(
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Data-bearing migration test: Downgrade succeeds when all records have non-NULL consignment_id and sha256_hash."""
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    c_a_id = h["consignment_a_id"]
+
+    # Insert a valid, fully-populated record
+    test_doc_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status
+            ) VALUES (
+                :id, :tenant_id, :consignment_id, 'PHYTOSANITARY_CERTIFICATE', 'compatible.pdf', 1024,
+                'application/pdf', 'tenants/t1/documents/compat', :sha256, 'AVAILABLE', NULL, 'CLEAN'
+            )
+        """),
+        {
+            "id": str(test_doc_id),
+            "tenant_id": str(tenant_a),
+            "consignment_id": str(c_a_id),
+            "sha256": "e" * 64,
+        },
+    )
+    await admin_session.commit()
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    try:
+        # Downgrade to 0003 with compatible records
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res.scalar() == "0003_membership_rls_policies"
+
+        # Re-upgrade to head (0004)
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0004_document_storage_fields"
+    finally:
+        # Clean up test document
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
+        await admin_session.commit()
+        # Ensure at head
+        res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        if res_check.scalar() != "0004_document_storage_fields":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Data-bearing migration test: Downgrade safely detects NULL values and aborts with actionable error."""
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+
+    # Insert a pre-consignment document record with NULL consignment_id and NULL sha256_hash
+    null_doc_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'unfinalized.pdf', 1024,
+                'application/pdf', 'tenants/t1/documents/unfin', NULL, 'PENDING_UPLOAD', 'tenants/t1/quarantine/unfin', 'PENDING'
+            )
+        """),
+        {"id": str(null_doc_id), "tenant_id": str(tenant_a)},
+    )
+    await admin_session.commit()
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    try:
+        # Attempt downgrade; must raise RuntimeError with remediation message
+        with pytest.raises(Exception) as excinfo:
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+
+        err_msg = str(excinfo.value)
+        assert "Cannot downgrade migration 0004_document_storage_fields" in err_msg
+        assert "contains 1 rows with NULL consignment_id" in err_msg
+        assert "Remediation: Associate unlinked documents with valid consignments" in err_msg
+
+        # Version must remain at 0004 because downgrade aborted
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res.scalar() == "0004_document_storage_fields"
+    finally:
+        # Clean up the test NULL row
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
+        await admin_session.commit()
+
+
+# ============================================================================
+# Package C: Real PostgreSQL 16 RLS Document Lifecycle & Audit Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_read_or_list_tenant_b_documents(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot read single documents or list any documents belonging to Tenant B."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # 1. Single read attempt of Tenant B document returns None under unprivileged regulens_app
+    stmt_single = select(Document).where(Document.id == doc_b_id)
+    res_single = await db_session.execute(stmt_single)
+    assert res_single.scalar_one_or_none() is None, "RLS Violation: Tenant A was able to read Tenant B document!"
+
+    # 2. List all documents under Tenant A context only returns Tenant A documents
+    stmt_list = select(Document)
+    res_list = await db_session.execute(stmt_list)
+    docs = res_list.scalars().all()
+    assert len(docs) > 0, "Tenant A should see its own documents"
+    for d in docs:
+        assert d.tenant_id == tenant_a, f"RLS Violation: Found document with tenant_id={d.tenant_id} under Tenant A context!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_finalize_or_tamper_tenant_b_upload(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot update status, quarantine_key, or storage_key of Tenant B's document."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # Attempt to finalize / tamper with Tenant B document affects 0 rows
+    res_update = await db_session.execute(
+        text("UPDATE documents SET status = 'AVAILABLE', quarantine_key = NULL WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert res_update.rowcount == 0, "RLS Violation: Tenant A updated Tenant B's document status!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_delete_tenant_b_document(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot delete Tenant B's document."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    res_delete = await db_session.execute(
+        text("DELETE FROM documents WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert res_delete.rowcount == 0, "RLS Violation: Tenant A deleted Tenant B's document!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_document_isolation_maintained_across_tenant_switching(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Switching transaction tenant context switches visibility cleanly without leakage."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+    doc_a_id = h["doc_a_id"]
+    doc_b_id = h["doc_b_id"]
+
+    # Context A
+    await set_tenant_context(db_session, tenant_a)
+    doc_a = (await db_session.execute(select(Document).where(Document.id == doc_a_id))).scalar_one_or_none()
+    assert doc_a is not None and doc_a.tenant_id == tenant_a
+    assert (await db_session.execute(select(Document).where(Document.id == doc_b_id))).scalar_one_or_none() is None
+
+    # Switch to Context B
+    await set_tenant_context(db_session, tenant_b)
+    doc_b = (await db_session.execute(select(Document).where(Document.id == doc_b_id))).scalar_one_or_none()
+    assert doc_b is not None and doc_b.tenant_id == tenant_b
+    assert (await db_session.execute(select(Document).where(Document.id == doc_a_id))).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_audit_events_tenant_isolated_and_append_only(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS & Permissions: Audit logs are tenant-isolated and strictly append-only under regulens_app."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+
+    # 1. Admin seeds an audit log for Tenant B
+    audit_b_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO audit_logs (id, tenant_id, action, resource_type, resource_id, details)
+            VALUES (:id, :tenant_id, 'DOCUMENT_UPLOAD_FINALIZED', 'document', :res_id, '{"doc": "secret"}')
+        """),
+        {"id": str(audit_b_id), "tenant_id": str(tenant_b), "res_id": str(uuid.uuid4())},
+    )
+    await admin_session.commit()
+
+    # 2. Tenant A connects under unprivileged regulens_app
+    await set_tenant_context(db_session, tenant_a)
+
+    # Tenant A cannot read Tenant B's audit log
+    audit_res = await db_session.execute(select(AuditLog).where(AuditLog.id == audit_b_id))
+    assert audit_res.scalar_one_or_none() is None, "RLS Violation: Tenant A read Tenant B's audit log!"
+
+    # 3. Tenant A seeds its own audit log via INSERT (permitted under append-only policy)
+    audit_a_id = uuid.uuid4()
+    await db_session.execute(
+        text("""
+            INSERT INTO audit_logs (id, tenant_id, action, resource_type, resource_id, details)
+            VALUES (:id, :tenant_id, 'DOCUMENT_UPLOAD_INITIATED', 'document', :res_id, '{"doc": "normal"}')
+        """),
+        {"id": str(audit_a_id), "tenant_id": str(tenant_a), "res_id": str(uuid.uuid4())},
+    )
+    await db_session.commit()
+
+    # 4. Attempting to UPDATE audit log is rejected by database permissions (SQLSTATE 42501)
+    await set_tenant_context(db_session, tenant_a)
+    with pytest.raises(DBAPIError) as exc_update:
+        await db_session.execute(
+            text("UPDATE audit_logs SET action = 'TAMPERED' WHERE id = :id"),
+            {"id": str(audit_a_id)},
+        )
+    assert exc_update.value.orig is not None
+    assert getattr(exc_update.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+    # 5. Attempting to DELETE audit log is rejected by database permissions (SQLSTATE 42501)
+    await set_tenant_context(db_session, tenant_a)
+    with pytest.raises(DBAPIError) as exc_delete:
+        await db_session.execute(
+            text("DELETE FROM audit_logs WHERE id = :id"),
+            {"id": str(audit_a_id)},
+        )
+    assert exc_delete.value.orig is not None
+    assert getattr(exc_delete.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+    # Cleanup admin records
+    await admin_session.execute(
+        text("DELETE FROM audit_logs WHERE id IN (:id_a, :id_b)"),
+        {"id_a": str(audit_a_id), "id_b": str(audit_b_id)},
+    )
+    await admin_session.commit()

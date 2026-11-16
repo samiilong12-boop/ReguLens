@@ -72,6 +72,25 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Pre-downgrade check: prevent silent data corruption or loss when records contain NULL values
+    bind = op.get_bind()
+    null_consignments = bind.execute(
+        sa.text("SELECT count(*) FROM documents WHERE consignment_id IS NULL")
+    ).scalar() or 0
+    null_hashes = bind.execute(
+        sa.text("SELECT count(*) FROM documents WHERE sha256_hash IS NULL")
+    ).scalar() or 0
+
+    if null_consignments > 0 or null_hashes > 0:
+        raise RuntimeError(
+            f"Cannot downgrade migration 0004_document_storage_fields to 0003_membership_rls_policies: "
+            f"Table 'documents' contains {null_consignments} rows with NULL consignment_id and "
+            f"{null_hashes} rows with NULL sha256_hash. "
+            f"Restoring NOT NULL constraints would fail or violate data integrity. "
+            f"Remediation: Associate unlinked documents with valid consignments and finalized SHA-256 hashes, "
+            f"or delete invalid unfinalized uploads before re-attempting migration downgrade."
+        )
+
     # 1. Drop index
     op.drop_index("idx_documents_status", table_name="documents")
 

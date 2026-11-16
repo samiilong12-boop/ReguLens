@@ -77,15 +77,19 @@ graph LR
     - Full FastAPI dependency chain integration tests (`tests/integration/test_fastapi_tenant_authorization.py`).
     - Verified by CI Run #43624757872 (82 passed tests, 44 RLS security tests).
   - **Package C: Private File Storage Pipeline & Upload Security (COMPLETED in Draft PR #3):**
-    - S3/GCS private storage integration with pre-signed temporary URLs (15-min expiry).
-    - MIME magic-byte validation (`file_validation.py`), file size limits (25MB hard cap).
-    - SHA-256 payload checksum verification on upload.
+    - S3 and GCS private storage integration (ADR 0008) with pre-signed temporary URLs (15-min expiry) and enforced HTTPS/SSL.
+    - Production fail-closed validation: rejects in-memory/local storage and mock scanners in staging/production.
+    - S3 PublicAccessBlock and GCS UBLA/PAP verification at application startup.
+    - Upload-time size enforcement (25MB hard cap) via S3 presigned POST `content-length-range` and direct bounded streaming upload endpoint.
+    - Pre-read memory exhaustion protection: metadata size inspection before loading quarantine payload into RAM.
+    - MIME magic-byte validation (`file_validation.py`) and SHA-256 payload checksum verification on upload.
     - Malware scanning subsystem (`scanner.py`, `ClamAVScanner`, `MockMalwareScanner` detecting EICAR, fail-safe error handling).
     - Two-phase upload lifecycle (`initiate-upload`, `finalize-upload`) with quarantine isolation.
+    - Quarantine retention cleanup: `purge_abandoned_quarantine_objects()` in `cleanup.py` pruning abandoned uploads older than 24 hours while preserving active uploads.
     - Authenticated download URL generation with status check and role-based deletion with storage purge.
-    - Alembic migration `0004_document_storage_fields.py` with bidirectional rollback verification.
-    - 21 integration tests in `tests/integration/test_document_lifecycle.py` and 4 unit test suites.
-  - **Exit Gate (Gate 1):** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented in Draft PRs (#1, #2, #3); remaining CI and verification gaps documented; awaiting founder sign-off.
+    - Alembic migration `0004_document_storage_fields.py` with safe downgrade guard against data loss on NULL records.
+    - 26 integration tests, 66 unit tests, and 52 PostgreSQL 16 RLS security tests (144 total tests, 100% pass rate).
+  - **Exit Gate (Gate 1):** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); remaining CI and verification gaps documented; awaiting founder sign-off.
 
 ---
 

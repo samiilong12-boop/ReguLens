@@ -202,15 +202,38 @@ _scanner_lock = threading.Lock()
 
 
 def get_malware_scanner() -> BaseMalwareScanner:
-    """Returns the configured malware scanner instance."""
+    """Returns the configured malware scanner instance.
+
+    Security guarantees:
+    - Never silently falls back to MockMalwareScanner on unknown or missing types.
+    - Fails immediately if an unrecognized scanner type is requested.
+    - Prohibits MockMalwareScanner in production/staging environments.
+    """
     global _scanner_instance
     with _scanner_lock:
         if _scanner_instance is None:
-            scanner_type = getattr(settings, "MALWARE_SCANNER_TYPE", "mock").lower()
+            raw_type = getattr(settings, "MALWARE_SCANNER_TYPE", None)
+            if not raw_type:
+                raise ValueError("Malware scanner configuration error: MALWARE_SCANNER_TYPE is not set.")
+
+            scanner_type = str(raw_type).strip().lower()
             if scanner_type == "clamav":
-                _scanner_instance = ClamAVScanner()
-            else:
+                _scanner_instance = ClamAVScanner(
+                    host=getattr(settings, "CLAMAV_HOST", "localhost"),
+                    port=getattr(settings, "CLAMAV_PORT", 3310),
+                    timeout=getattr(settings, "CLAMAV_TIMEOUT_SECONDS", 5.0),
+                )
+            elif scanner_type == "mock":
+                env = (getattr(settings, "ENVIRONMENT", "") or "").strip().lower()
+                if env in {"production", "prod", "staging"}:
+                    raise RuntimeError(
+                        "Production security violation: MockMalwareScanner is strictly forbidden in production/staging."
+                    )
                 _scanner_instance = MockMalwareScanner()
+            else:
+                raise ValueError(
+                    f"Unknown malware scanner type: '{raw_type}'. Supported types: ['clamav', 'mock']."
+                )
     return _scanner_instance
 
 

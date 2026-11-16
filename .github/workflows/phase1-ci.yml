@@ -173,8 +173,8 @@ jobs:
           print(f'Total Skipped        : {total_skipped}')
           print(f'RLS Skipped          : {rls_skipped}')
 
-          min_total_tests = 110
-          min_rls_tests = 45
+          min_total_tests = 140
+          min_rls_tests = 50
 
           if total_tests < min_total_tests:
               print(f'CI Quality Gate Violation: Executed total tests ({total_tests}) below required minimum ({min_total_tests})!', file=sys.stderr)

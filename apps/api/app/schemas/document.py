@@ -34,6 +34,8 @@ class DocumentUploadInitiateResponse(BaseModel):
     quarantine_key: str
     status: str
     created_at: datetime
+    upload_method: str = "PUT"
+    upload_fields: Optional[dict] = None
 
 
 class DocumentFinalizeRequest(BaseModel):

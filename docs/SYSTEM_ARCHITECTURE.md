@@ -107,22 +107,32 @@ graph TD
 
 ## 5. Secure Document Storage & Upload Pipeline (Package C)
 
-- **Storage Abstraction:** Provider-independent `StorageService` interface implemented across `MemoryStorageService` (in-memory testing), `LocalStorageService` (development filesystem with path-traversal protection), and `S3StorageService` (production S3/GCS-compatible private bucket).
-- **Private Storage Invariant:** 100% private bucket; zero public ACLs or public URLs. All client upload and download access operates exclusively through short-lived presigned URLs (15-minute expiry).
+- **Storage Abstraction:** Provider-independent `StorageService` interface implemented across:
+  - `MemoryStorageService`: In-memory dictionary storage with size checking for fast, isolated CI testing.
+  - `LocalStorageService`: Development filesystem storage with strict path-traversal prevention.
+  - `S3StorageService`: AWS S3 / MinIO object storage with mandatory SSL in production, presigned POST upload policies with `content-length-range` enforcement, and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
+  - `GCSStorageService`: Google Cloud Storage adapter (GCP compatibility per ADR 0008) supporting signed URLs, bounded streaming reads, and verification of Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
+- **Private Storage Invariant:** 100% private bucket; zero public ACLs or public URLs. All client upload and download access operates exclusively through short-lived presigned URLs (15-minute expiry) or bounded API endpoints.
+- **Transport Security:** Production and staging environments strictly require HTTPS/SSL (`S3_USE_SSL=True`); insecure `http://` endpoint URLs raise fail-closed configuration errors at startup.
 - **Opaque Key Strategy:** User-supplied filenames are never used in object storage paths. Keys are strictly randomized and tenant-partitioned:
   - Quarantine: `tenants/{tenant_id}/quarantine/{opaque_uuid}`
   - Permanent: `tenants/{tenant_id}/documents/{opaque_uuid}`
+- **Upload Size Enforcement & Memory Exhaustion Protection:**
+  - Hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
+  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; direct uploads via streaming endpoint `POST /api/v1/documents/{document_id}/upload-content` enforce byte bounds on header and streaming chunks.
+  - During finalization, server inspects object metadata (`get_object_metadata`) to verify size *before* reading payload into memory, preventing memory exhaustion (DoS). Oversized objects in quarantine are safely deleted and rejected with HTTP 400.
 - **Two-Phase Upload Lifecycle:**
-  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues a 15-minute presigned PUT URL to the quarantine prefix.
-  2. *Client Upload:* Client streams bytes directly to the presigned quarantine URL.
-  3. *Finalization & Validation (`POST /documents/{id}/finalize-upload`):* Server fetches raw bytes from quarantine, enforces size ceiling (≤ 25MB), executes file signature inspection (magic-byte detection for approved MIME types: `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`), and verifies SHA-256 checksum integrity.
+  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues a 15-minute presigned upload URL to the quarantine prefix.
+  2. *Client Upload:* Client streams bytes directly to the presigned quarantine URL (or `/upload-content` streaming endpoint).
+  3. *Finalization & Validation (`POST /documents/{id}/finalize-upload`):* Server verifies size from metadata, fetches raw bytes with strict `max_bytes` limit, executes file signature inspection (magic-byte detection for approved MIME types: `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`), and verifies SHA-256 checksum integrity.
   4. *Malware Scanning Subsystem:* Dispatches to `BaseMalwareScanner`:
      - *Clean Scan:* Atomically promotes object from quarantine to permanent storage, purges quarantine object, sets status to `AVAILABLE` and `antivirus_status` to `CLEAN`.
      - *Infected Scan (EICAR / Virus):* Deletes quarantined file immediately, sets status to `REJECTED`, `antivirus_status` to `INFECTED`, records virus signature, and returns HTTP 422.
      - *Scanner Unavailability / Error:* Fails safe with HTTP 503; document remains `QUARANTINED` and is NEVER marked clean or available.
+- **Quarantine Retention & Pruning:** Abandoned quarantine objects older than 24 hours are safely purged by `purge_abandoned_quarantine_objects()` in `apps/api/app/services/cleanup.py`, runnable via CLI (`python -m app.services.cleanup --cutoff-hours 24`), preserving active uploads under 24 hours.
 - **Secure Download Gate:** Presigned GET URLs (15-min expiry) are generated only for documents where `status == "AVAILABLE"` and `antivirus_status == "CLEAN"`. All unvalidated, quarantined, rejected, or infected documents return HTTP 403 Forbidden.
-- **Audit Logging & Secret Redaction:** Append-only audit records are written on initiation, finalization, download URL generation, and deletion. All presigned URLs, query signatures, tokens, and passwords are sanitized before audit persistence.
+- **Audit Logging & Secret Redaction:** Append-only audit records are written on initiation, finalization, download URL generation, deletion, and cleanup events. All presigned URLs, query signatures, tokens, and passwords are sanitized before audit persistence.
 - **Antivirus Engine Disclosure:**
-  - *Production Target:* `ClamAVScanner` connecting over TCP (`zINSTREAM` protocol) with fail-closed timeout and connection error handling.
+  - *Production Target:* `ClamAVScanner` connecting over TCP (`zINSTREAM` protocol) with fail-closed timeout and connection error handling. Production/staging strictly rejects `MockMalwareScanner`.
   - *Testing / CI Engine:* `MockMalwareScanner` with built-in EICAR antivirus test signature detection and configurable failure simulation.
-  - *Local Development Notice:* Magic-byte checking is NOT claimed to be equivalent to antivirus scanning. Live ClamAV daemon connectivity is required for production certification.
+  - *Operational Notice:* Magic-byte checking is NOT claimed to be equivalent to antivirus scanning. Live ClamAV daemon connectivity and properly configured cloud buckets are required for production certification.

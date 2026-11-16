@@ -2,12 +2,20 @@
 from pathlib import Path
 import tempfile
 import uuid
+from unittest.mock import MagicMock, patch
 import pytest
 
+from app.core.config import Settings
 from app.services.storage import (
     MemoryStorageService,
     LocalStorageService,
+    S3StorageService,
+    GCSStorageService,
+    StorageSecurityError,
+    StoragePayloadTooLargeError,
     generate_tenant_object_key,
+    get_storage_service,
+    set_storage_service,
 )
 
 
@@ -92,3 +100,160 @@ def test_local_storage_path_traversal_prevention():
                 storage.get_object(bad_key)
             with pytest.raises(ValueError, match="Path traversal detected"):
                 storage.object_exists(bad_key)
+
+
+# ==============================================================================
+# Package C: Size Enforcement, S3 Security & GCS Adapter Tests
+# ==============================================================================
+
+def test_storage_size_enforcement_in_memory_and_local():
+    """Object size limits (25MB) must be enforced across put and bounded get operations."""
+    storage = MemoryStorageService()
+    oversized = b"A" * (25 * 1024 * 1024 + 1)
+    with pytest.raises(StoragePayloadTooLargeError):
+        storage.put_object("tenants/t1/quarantine/too_big", oversized)
+
+    # Valid size put, but restricted get_object max_bytes
+    storage.put_object("tenants/t1/quarantine/bounded", b"1234567890")
+    with pytest.raises(StoragePayloadTooLargeError):
+        storage.get_object("tenants/t1/quarantine/bounded", max_bytes=5)
+
+
+def test_s3_storage_presigned_post_content_length_range():
+    """S3 upload generation must enforce upload-time content-length-range policy conditions."""
+    mock_boto = MagicMock()
+    mock_client = MagicMock()
+    mock_client.generate_presigned_post.return_value = {
+        "url": "https://s3.amazonaws.com/test-bucket",
+        "fields": {"key": "tenants/t1/quarantine/uuid1", "policy": "xyz=="},
+    }
+    mock_boto.client.return_value = mock_client
+
+    with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
+        s3 = S3StorageService(bucket_name="test-bucket", use_ssl=True)
+        info = s3.generate_presigned_upload_url(
+            object_key="tenants/t1/quarantine/uuid1",
+            content_type="application/pdf",
+            max_size_bytes=26214400,
+        )
+
+        assert info.method == "POST"
+        assert info.url == "https://s3.amazonaws.com/test-bucket"
+        assert info.fields["policy"] == "xyz=="
+
+        # Assert content-length-range was passed in conditions
+        calls = mock_client.generate_presigned_post.call_args
+        conditions = calls[1]["Conditions"]
+        assert ["content-length-range", 1, 26214400] in conditions
+
+
+def test_s3_storage_verify_bucket_configuration():
+    """S3 bucket verification must fail closed if public access block settings are missing or incomplete."""
+    mock_boto = MagicMock()
+    mock_client = MagicMock()
+    mock_boto.client.return_value = mock_client
+
+    with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
+        s3 = S3StorageService(bucket_name="secure-bucket")
+
+        # 1. Successful verification when all 4 controls are enabled
+        mock_client.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            }
+        }
+        res = s3.verify_bucket_configuration()
+        assert res["status"] == "verified"
+        assert res["public_access_blocked"] is True
+
+        # 2. Failure when one control is False
+        mock_client.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": False,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            }
+        }
+        with pytest.raises(StorageSecurityError, match="incomplete public access block"):
+            s3.verify_bucket_configuration()
+
+
+def test_gcs_storage_service_operations_and_ubla_verification():
+    """GCS adapter must generate signed URLs, enforce bounded reads, and verify UBLA security controls."""
+    mock_storage = MagicMock()
+    mock_client = MagicMock()
+    mock_bucket = MagicMock()
+    mock_blob = MagicMock()
+
+    mock_storage.Client.return_value = mock_client
+    mock_client.bucket.return_value = mock_bucket
+    mock_bucket.blob.return_value = mock_blob
+
+    mock_google = MagicMock()
+    mock_google.storage = mock_storage
+
+    with patch.dict("sys.modules", {"google": MagicMock(cloud=mock_google), "google.cloud": mock_google, "google.cloud.storage": mock_storage}):
+        gcs = GCSStorageService(bucket_name="gcs-secure-bucket")
+
+        # 1. Presigned upload & download
+        mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-url"
+        up = gcs.generate_presigned_upload_url("tenants/t1/quarantine/gcs-uuid")
+        assert up.url == "https://storage.googleapis.com/signed-url"
+        assert up.method == "PUT"
+
+        down = gcs.generate_presigned_download_url("tenants/t1/documents/gcs-uuid")
+        assert down.url == "https://storage.googleapis.com/signed-url"
+        assert down.method == "GET"
+
+        # 2. Bounded get_object rejects oversized blob
+        mock_blob.exists.return_value = True
+        mock_blob.size = 30 * 1024 * 1024  # 30MB
+        with pytest.raises(StoragePayloadTooLargeError):
+            gcs.get_object("tenants/t1/quarantine/gcs-uuid", max_bytes=26214400)
+
+        # 3. UBLA and public access prevention verification
+        mock_client.get_bucket.return_value = mock_bucket
+        iam_cfg = MagicMock()
+        iam_cfg.uniform_bucket_level_access_enabled = True
+        iam_cfg.public_access_prevention = "enforced"
+        mock_bucket.iam_configuration = iam_cfg
+
+        status = gcs.verify_bucket_configuration()
+        assert status["status"] == "verified"
+        assert status["uniform_bucket_level_access"] is True
+        assert status["public_access_prevention"] == "enforced"
+
+        # 4. Fails if UBLA disabled
+        iam_cfg.uniform_bucket_level_access_enabled = False
+        with pytest.raises(StorageSecurityError, match="Uniform Bucket-Level Access"):
+            gcs.verify_bucket_configuration()
+
+
+def test_get_storage_service_production_fail_closed():
+    """Factory get_storage_service must raise RuntimeError in production if non-cloud storage is selected."""
+    from app.services.storage import _storage_lock
+    import app.services.storage as storage_mod
+
+    # Reset singleton
+    with _storage_lock:
+        storage_mod._storage_instance = None
+
+    with patch.object(storage_mod.settings, "ENVIRONMENT", "production"), \
+         patch.object(storage_mod.settings, "STORAGE_BACKEND", "memory"):
+        with pytest.raises(RuntimeError, match="Production security violation: In-memory or local filesystem storage"):
+            get_storage_service()
+
+    with _storage_lock:
+        storage_mod._storage_instance = None
+
+    with patch.object(storage_mod.settings, "ENVIRONMENT", "development"), \
+         patch.object(storage_mod.settings, "STORAGE_BACKEND", "invalid_backend"):
+        with pytest.raises(ValueError, match="Unknown storage backend: 'invalid_backend'"):
+            get_storage_service()
+
+    with _storage_lock:
+        storage_mod._storage_instance = None

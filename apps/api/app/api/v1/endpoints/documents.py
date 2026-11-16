@@ -15,6 +15,7 @@ from app.api.deps import (
     require_compliance_officer,
     require_viewer,
 )
+from app.core.config import settings
 from app.db.models import Document, Consignment
 from app.schemas.document import (
     DocumentUploadInitiateRequest,
@@ -100,7 +101,7 @@ async def initiate_upload(
         object_key=quarantine_key,
         expires_in_seconds=900,
         content_type=payload.claimed_mime_type,
-        max_size_bytes=payload.expected_size_bytes,
+        max_size_bytes=min(payload.expected_size_bytes, settings.MAX_DOCUMENT_SIZE_BYTES),
     )
 
     # Log immutable audit event
@@ -119,6 +120,7 @@ async def initiate_upload(
             "document_type": payload.document_type,
             "consignment_id": str(payload.consignment_id) if payload.consignment_id else None,
             "expires_in_seconds": presigned.expires_in_seconds,
+            "upload_method": presigned.method,
         },
         ip_address=ip,
         user_agent=ua,
@@ -134,7 +136,87 @@ async def initiate_upload(
         quarantine_key=quarantine_key,
         status=document.status,
         created_at=document.created_at,
+        upload_method=presigned.method,
+        upload_fields=presigned.fields or None,
     )
+
+
+@router.post(
+    "/{document_id}/upload-content",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Direct bounded streaming upload to quarantine with upload-time size enforcement",
+)
+async def upload_document_content(
+    document_id: UUID,
+    request: Request,
+    current_user: CurrentUser = Depends(require_compliance_officer),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> DocumentResponse:
+    """Direct bounded streaming upload endpoint providing upload-time size enforcement.
+
+    Security guarantees:
+    - Rejects Content-Length headers exceeding 25MB before streaming.
+    - Aborts immediately if streamed payload exceeds 25MB (26,214,400 bytes).
+    - Prevents unbounded memory accumulation during upload.
+    - Writes directly into quarantine isolation path.
+    """
+    storage_service = get_storage_service()
+
+    # 1. Fetch document under RLS
+    stmt = select(Document).where(
+        Document.id == document_id,
+        Document.tenant_id == current_user.tenant_id,
+    )
+    document = (await db.execute(stmt)).scalar_one_or_none()
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if document.status != "PENDING_UPLOAD":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Document is not pending upload (current status: '{document.status}').",
+        )
+
+    # 2. Check Content-Length header ceiling
+    content_length_header = request.headers.get("content-length")
+    if content_length_header:
+        try:
+            cl = int(content_length_header)
+            if cl > settings.MAX_DOCUMENT_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Content-Length ({cl} bytes) exceeds maximum permitted limit of {settings.MAX_DOCUMENT_SIZE_BYTES} bytes.",
+                )
+        except ValueError:
+            pass
+
+    # 3. Stream chunks with hard byte count ceiling
+    max_limit = settings.MAX_DOCUMENT_SIZE_BYTES
+    chunks = []
+    total_bytes = 0
+
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_limit:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Uploaded stream exceeded maximum permitted limit of {max_limit} bytes.",
+            )
+        chunks.append(chunk)
+
+    if total_bytes == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded stream payload is empty (0 bytes).",
+        )
+
+    data = b"".join(chunks)
+    storage_service.put_object(document.quarantine_key, data, content_type=document.mime_type)
+    document.file_size_bytes = total_bytes
+    await db.commit()
+    await db.refresh(document)
+    return DocumentResponse.model_validate(document)
 
 
 @router.post(
@@ -190,8 +272,67 @@ async def finalize_upload(
             detail="Upload payload not found in storage quarantine. Please upload file before finalization.",
         )
 
-    # Read payload bytes from quarantine
-    data = storage_service.get_object(document.quarantine_key)
+    # Pre-read metadata inspection: prevent unbounded memory consumption
+    try:
+        metadata = storage_service.get_object_metadata(document.quarantine_key)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unable to inspect quarantine object metadata: {e}",
+        )
+
+    if metadata.size_bytes > settings.MAX_DOCUMENT_SIZE_BYTES:
+        storage_service.delete_object(document.quarantine_key)
+        document.status = "REJECTED"
+        document.antivirus_status = "REJECTED_OVERSIZED"
+        document.rejection_reason = (
+            f"File size ({metadata.size_bytes} bytes) exceeds maximum permitted limit of {settings.MAX_DOCUMENT_SIZE_BYTES} bytes."
+        )
+        document.file_size_bytes = metadata.size_bytes
+        await log_document_audit_event(
+            db=db,
+            tenant_id=current_user.tenant_id,
+            action="DOCUMENT_VALIDATION_FAILED",
+            resource_id=document.id,
+            user_id=current_user.id,
+            details={
+                "reason": document.rejection_reason,
+                "file_size_bytes": metadata.size_bytes,
+                "max_permitted_bytes": settings.MAX_DOCUMENT_SIZE_BYTES,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=document.rejection_reason,
+        )
+
+    if metadata.size_bytes == 0:
+        storage_service.delete_object(document.quarantine_key)
+        document.status = "REJECTED"
+        document.antivirus_status = "REJECTED_EMPTY_FILE"
+        document.rejection_reason = "File payload is empty (0 bytes)."
+        document.file_size_bytes = 0
+        await log_document_audit_event(
+            db=db,
+            tenant_id=current_user.tenant_id,
+            action="DOCUMENT_VALIDATION_FAILED",
+            resource_id=document.id,
+            user_id=current_user.id,
+            details={"reason": document.rejection_reason},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=document.rejection_reason,
+        )
+
+    # Read payload bytes bounded by MAX_DOCUMENT_SIZE_BYTES
+    data = storage_service.get_object(document.quarantine_key, max_bytes=settings.MAX_DOCUMENT_SIZE_BYTES)
 
     # Expected SHA-256 can come from initiation or finalize payload
     expected_sha256 = (payload.expected_sha256 if payload else None) or document.sha256_hash

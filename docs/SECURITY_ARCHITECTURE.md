@@ -108,32 +108,43 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
 
 - **Pluggable Storage Abstraction:**
   The `StorageService` interface (`apps/api/app/services/storage.py`) provides backend-agnostic storage operations with concrete implementations:
-  - `MemoryStorageService`: In-memory dictionary storage for fast, isolated unit and integration testing.
-  - `LocalStorageService`: Filesystem storage for local development environments.
-  - `S3StorageService`: AWS S3 / MinIO / GCS S3-compatible cloud object storage with public access completely blocked (`BlockPublicAcls = true`, `BlockPublicPolicy = true`).
+  - `MemoryStorageService`: In-memory dictionary storage with size enforcement for fast, isolated unit and integration testing. Strictly prohibited in staging/production.
+  - `LocalStorageService`: Filesystem storage with strict path-traversal prevention for local development. Strictly prohibited in staging/production.
+  - `S3StorageService`: AWS S3 / MinIO cloud object storage with enforced HTTPS/SSL (`S3_USE_SSL=True`), presigned POST upload policies with `content-length-range` condition, and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
+  - `GCSStorageService`: Google Cloud Storage adapter (GCP compatibility per ADR 0008) supporting signed URLs, bounded streaming reads, and startup verification of Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
 
-- **Two-Phase Upload Lifecycle & Quarantine Isolation:**
+- **Production Fail-Closed Configuration:**
+  - Application startup lifespan (`apps/api/app/main.py`) validates that production/staging environments never use in-memory storage, local disk storage, or mock malware scanning.
+  - Unknown storage backends and unknown scanner types fail closed immediately at configuration load time.
+  - In production/staging, `verify_bucket_configuration()` runs against the active storage provider to ensure public access is completely blocked; failure aborts startup.
+
+- **Two-Phase Upload Lifecycle & Bounded Quarantine Isolation:**
   Direct arbitrary uploads to permanent document paths are strictly prevented:
   1. **Phase 1: Upload Initiation (`POST /api/v1/documents/initiate-upload`):**
      - Client requests an upload slot with metadata (filename, declared MIME type, optional consignment reference).
      - System validates declared MIME type against allowed whitelist (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`).
      - Server allocates a cryptographically random UUID and stores the file under an isolated quarantine prefix: `tenants/{tenant_id}/quarantine/{uuid}`.
      - Document record is created in the database with status `PENDING_VALIDATION` and `quarantine_key` populated.
-     - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds).
+     - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds). For S3, presigned POST policy conditions restrict upload size to `[1, 26214400]` bytes.
+     - Alternatively, direct bounded streaming uploads are accepted via `POST /api/v1/documents/{document_id}/upload-content` enforcing the 25MB ceiling on headers and incoming byte chunks.
   2. **Phase 2: Upload Finalization & Validation (`POST /api/v1/documents/{id}/finalize-upload`):**
      - Client confirms upload completion with expected SHA-256 hash.
-     - Server retrieves the uploaded object from quarantine storage.
-     - **File Size Verification:** Payload is inspected to ensure it does not exceed the hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
-     - **Magic-Byte Signature Verification:** Server inspects the binary header bytes (`file_validation.py`) to confirm actual content matches declared MIME type (e.g. `%PDF-` for PDF, `\x89PNG\r\n\x1a\n` for PNG, `\xff\xd8\xff` for JPEG, `II*\x00` or `MM\x00*` for TIFF). Mismatched magic bytes immediately reject the file (HTTP 400).
+     - **Pre-Read Memory Exhaustion Protection:** The server queries `get_object_metadata` from storage *before* reading the object payload into memory. If the quarantined object exceeds the hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`), the file is immediately purged from quarantine, an audit event is emitted, and HTTP 400 is returned without buffering the oversized object into RAM.
+     - **Bounded Retrieval:** Object retrieval uses `get_object(..., max_bytes=26214400)` to ensure stream limits are strictly enforced.
+     - **Magic-Byte Signature Verification:** Server inspects the binary header bytes (`file_validation.py`) to confirm actual content matches declared MIME type (e.g. `%PDF-` for PDF, `\x89PNG\r\n\x1a\n` for PNG, `\xff\xd8\xff` for JPEG, `II*\x00` or `MM\x00*` for TIFF). Mismatched magic bytes immediately reject the file (HTTP 400) and purge quarantine storage.
      - **SHA-256 Checksum Verification:** Server computes the SHA-256 hash of the payload and verifies it against client-provided hash (HTTP 400 on mismatch).
      - **Malware Scanning:** Payload is passed to the malware scanner subsystem.
      - **Atomic Promotion:** Upon passing all checks, the object is copied/moved to permanent storage at `tenants/{tenant_id}/documents/{uuid}`, the quarantine object is deleted, `quarantine_key` is cleared (`None`), document status is updated to `AVAILABLE`, and `validated_at` timestamp is set.
+
+- **Quarantine Retention & Cleanup (`apps/api/app/services/cleanup.py`):**
+  - Abandoned quarantine objects older than 24 hours are safely pruned via `purge_abandoned_quarantine_objects()`.
+  - Operator CLI command `python -m app.services.cleanup --cutoff-hours 24` removes orphaned quarantine objects from storage, marks matching database records `FAILED`/`ABANDONED_TIMEOUT`, and records audit entries while preserving active uploads (< 24 hours).
 
 - **Malware Scanning Subsystem (`scanner.py`):**
   - **Interface:** `BaseMalwareScanner` defining `scan_bytes(data: bytes, filename: str) -> ScanResult`.
   - **Fail-Safe Invariant:** If the malware scanner is unreachable, times out, or encounters an internal socket error, it raises `ScannerUnavailableError` resulting in **HTTP 503 Service Unavailable**. The system **NEVER** silently marks an unscanned file as clean.
   - **ClamAV Integration:** `ClamAVScanner` communicates with ClamAV daemon via TCP socket using the `zINSTREAM\0` streaming protocol. Configurable via `CLAMAV_HOST`, `CLAMAV_PORT`, and `CLAMAV_TIMEOUT_SECONDS`.
-  - **Mock Scanner:** `MockMalwareScanner` for test environments detects standard EICAR test strings (`X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`).
+  - **Mock Scanner:** `MockMalwareScanner` for test environments detects standard EICAR test strings (`X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`). Production/staging environments fail closed if mock scanner is configured.
   - **Infection Handling:** If malware is detected, the upload is rejected with **HTTP 422 Unprocessable Content**, the file is immediately purged from quarantine storage, and the database record is updated to `status = "QUARANTINED"` with `rejection_reason = "Malware detected: {threat_name}"`.
 
 - **Secure Download & Access Control (`GET /api/v1/documents/{id}/download-url`):**
@@ -147,8 +158,13 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
   - The permanent storage object is purged from the storage backend.
   - The document record is removed from the database, and an immutable audit log is generated.
 
+- **PostgreSQL 16 RLS Security & Immutability:**
+  - Real PostgreSQL 16 RLS integration tests (`tests/security/test_postgres_rls.py`, 52 tests) execute as unprivileged runtime role `regulens_app` (`NOBYPASSRLS`).
+  - Proves Tenant A cannot read, list, finalize, tamper, download, or delete Tenant B's documents.
+  - Audit logs are tenant-isolated and strictly append-only; unprivileged attempts to UPDATE or DELETE raise SQLSTATE 42501 (insufficient privilege).
+
 - **Sanitized Audit Trail:**
-  - All file lifecycle events (`DOCUMENT_UPLOAD_INITIATED`, `DOCUMENT_UPLOAD_FINALIZED`, `DOCUMENT_UPLOAD_FAILED`, `DOCUMENT_DOWNLOAD_URL_GENERATED`, `DOCUMENT_DELETED`) are emitted to `audit_logs`.
+  - All file lifecycle events (`DOCUMENT_UPLOAD_INITIATED`, `DOCUMENT_UPLOAD_FINALIZED`, `DOCUMENT_UPLOAD_FAILED`, `DOCUMENT_DOWNLOAD_URL_GENERATED`, `DOCUMENT_DELETED`, `DOCUMENT_QUARANTINE_PURGED`) are emitted to `audit_logs`.
   - Presigned URLs, query tokens, and authorization headers are automatically redacted prior to log persistence.
 
 ### 3.5. AI & Prompt Boundary Security
