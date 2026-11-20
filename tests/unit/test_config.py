@@ -63,6 +63,12 @@ def test_production_succeeds_with_strong_unique_jwt_secret():
         ENVIRONMENT="production",
         JWT_SECRET_KEY=strong_secret,
         ALLOW_DEV_TENANT_BYPASS=False,
+        STORAGE_BACKEND="s3",
+        S3_USE_SSL=True,
+        S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+        S3_BUCKET_NAME="prod-regulens-docs",
+        MALWARE_SCANNER_TYPE="clamav",
+        CLAMAV_HOST="clamav.internal",
     )
     assert settings.ENVIRONMENT == "production"
     assert settings.JWT_SECRET_KEY == strong_secret
@@ -153,4 +159,183 @@ def test_development_allows_check_db_role_on_startup_false_if_explicitly_configu
     )
     assert dev_settings.CHECK_DB_ROLE_ON_STARTUP is False
 
+
+# ==============================================================================
+# Package C: Storage & Malware Scanner Production Fail-Closed Tests
+# ==============================================================================
+
+def test_unknown_storage_backend_rejected_across_all_environments():
+    """Unknown storage backend names must raise ValueError immediately."""
+    with pytest.raises(ValueError) as excinfo:
+        Settings(STORAGE_BACKEND="unsupported_azure_blob")
+    assert "Unknown STORAGE_BACKEND 'unsupported_azure_blob'" in str(excinfo.value)
+
+
+def test_unknown_malware_scanner_type_rejected_across_all_environments():
+    """Unknown malware scanner types must raise ValueError immediately."""
+    with pytest.raises(ValueError) as excinfo:
+        Settings(MALWARE_SCANNER_TYPE="unsupported_kaspersky")
+    assert "Unknown MALWARE_SCANNER_TYPE 'unsupported_kaspersky'" in str(excinfo.value)
+
+
+def test_production_rejects_memory_storage_backend():
+    """Production must fail closed if in-memory storage is configured."""
+    strong_secret = "f" * 32 + "_production_unique_entropy_key_memory"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="memory",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "Non-persistent storage backend 'memory' is strictly forbidden in production" in str(excinfo.value)
+
+
+def test_production_rejects_local_storage_backend():
+    """Production must fail closed if local filesystem storage is configured."""
+    strong_secret = "g" * 32 + "_production_unique_entropy_key_local"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="local",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "Non-persistent storage backend 'local' is strictly forbidden in production" in str(excinfo.value)
+
+
+def test_production_rejects_mock_malware_scanner():
+    """Production must fail closed if MockMalwareScanner is configured."""
+    strong_secret = "h" * 32 + "_production_unique_entropy_key_mock_scan"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="s3",
+            S3_USE_SSL=True,
+            S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+            S3_BUCKET_NAME="prod-regulens-docs",
+            MALWARE_SCANNER_TYPE="mock",
+        )
+    assert "MockMalwareScanner is strictly forbidden in production" in str(excinfo.value)
+
+
+def test_production_rejects_s3_without_ssl():
+    """Production must fail closed if S3_USE_SSL is False."""
+    strong_secret = "i" * 32 + "_production_unique_entropy_key_ssl"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="s3",
+            S3_USE_SSL=False,
+            S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+            S3_BUCKET_NAME="prod-regulens-docs",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "S3_USE_SSL must be True in production/staging" in str(excinfo.value)
+
+
+def test_production_rejects_s3_insecure_http_endpoint():
+    """Production must fail closed if S3_ENDPOINT_URL uses insecure http://."""
+    strong_secret = "j" * 32 + "_production_unique_entropy_key_http"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="s3",
+            S3_USE_SSL=True,
+            S3_ENDPOINT_URL="http://s3.eu-central-1.amazonaws.com",
+            S3_BUCKET_NAME="prod-regulens-docs",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "Insecure HTTP endpoint URL is strictly forbidden in production/staging" in str(excinfo.value)
+
+
+def test_production_requires_s3_bucket_name():
+    """Production must fail closed if S3_BUCKET_NAME is empty."""
+    strong_secret = "k" * 32 + "_production_unique_entropy_key_bucket"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="s3",
+            S3_USE_SSL=True,
+            S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+            S3_BUCKET_NAME="",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "S3_BUCKET_NAME must be explicitly configured" in str(excinfo.value)
+
+
+def test_production_requires_gcs_bucket_name():
+    """Production must fail closed if GCS_BUCKET_NAME is empty when GCS backend is selected."""
+    strong_secret = "l" * 32 + "_production_unique_entropy_key_gcs"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="gcs",
+            GCS_BUCKET_NAME="",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="clamav.internal",
+        )
+    assert "GCS_BUCKET_NAME must be explicitly configured" in str(excinfo.value)
+
+
+def test_production_requires_clamav_host():
+    """Production must fail closed if CLAMAV_HOST is empty when ClamAV scanner is selected."""
+    strong_secret = "m" * 32 + "_production_unique_entropy_key_clamav"
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            ENVIRONMENT="production",
+            JWT_SECRET_KEY=strong_secret,
+            STORAGE_BACKEND="s3",
+            S3_USE_SSL=True,
+            S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+            S3_BUCKET_NAME="prod-regulens-docs",
+            MALWARE_SCANNER_TYPE="clamav",
+            CLAMAV_HOST="",
+        )
+    assert "CLAMAV_HOST must be explicitly configured" in str(excinfo.value)
+
+
+def test_production_succeeds_with_valid_s3_and_clamav_configuration():
+    """Production startup succeeds when strong JWT, S3 over HTTPS with SSL, and ClamAV are configured."""
+    strong_secret = "n" * 32 + "_production_unique_entropy_key_valid"
+    prod_settings = Settings(
+        ENVIRONMENT="production",
+        JWT_SECRET_KEY=strong_secret,
+        STORAGE_BACKEND="s3",
+        S3_USE_SSL=True,
+        S3_ENDPOINT_URL="https://s3.eu-central-1.amazonaws.com",
+        S3_BUCKET_NAME="prod-regulens-docs",
+        MALWARE_SCANNER_TYPE="clamav",
+        CLAMAV_HOST="clamav.production.internal",
+        CLAMAV_PORT=3310,
+    )
+    assert prod_settings.STORAGE_BACKEND == "s3"
+    assert prod_settings.S3_USE_SSL is True
+    assert prod_settings.MALWARE_SCANNER_TYPE == "clamav"
+
+
+def test_production_succeeds_with_valid_gcs_and_clamav_configuration():
+    """Production startup succeeds when strong JWT, GCS, and ClamAV are configured."""
+    strong_secret = "o" * 32 + "_production_unique_entropy_key_gcs_valid"
+    prod_settings = Settings(
+        ENVIRONMENT="production",
+        JWT_SECRET_KEY=strong_secret,
+        STORAGE_BACKEND="gcs",
+        GCS_BUCKET_NAME="prod-regulens-gcs-docs",
+        MALWARE_SCANNER_TYPE="clamav",
+        CLAMAV_HOST="clamav.production.internal",
+        CLAMAV_PORT=3310,
+    )
+    assert prod_settings.STORAGE_BACKEND == "gcs"
+    assert prod_settings.MALWARE_SCANNER_TYPE == "clamav"
 

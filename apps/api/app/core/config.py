@@ -2,7 +2,7 @@
 
 Secrets are strictly read from environment variables.
 """
-from typing import List
+from typing import List, Optional
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -50,13 +50,28 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # Object Storage
+    # Object Storage & Upload Security (Package C)
+    STORAGE_BACKEND: str = Field(default="memory")  # "memory", "local", "s3", "gcs"
+    LOCAL_STORAGE_PATH: str = Field(default="./data/storage")
     S3_ENDPOINT_URL: str = "http://localhost:9000"
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
     S3_BUCKET_NAME: str = "regulens-documents"
     S3_REGION: str = "us-east-1"
     S3_USE_SSL: bool = False
+    MAX_DOCUMENT_SIZE_BYTES: int = 25 * 1024 * 1024  # 25 MB strict limit
+    PRESIGNED_URL_EXPIRE_SECONDS: int = 900  # 15 minutes strict expiry
+
+    # Google Cloud Storage Configuration (Package C - GCP Compatibility)
+    GCS_BUCKET_NAME: str = "regulens-documents"
+    GCS_PROJECT_ID: Optional[str] = None
+    GCS_CREDENTIALS_FILE: Optional[str] = None
+
+    # Malware Scanner Configuration (Package C)
+    MALWARE_SCANNER_TYPE: str = Field(default="mock")  # "mock", "clamav"
+    CLAMAV_HOST: str = "localhost"
+    CLAMAV_PORT: int = 3310
+    CLAMAV_TIMEOUT_SECONDS: float = 5.0
 
     # AI Integration Boundary
     AI_PROVIDER: str = "gemini"
@@ -83,6 +98,24 @@ class Settings(BaseSettings):
                 f"Database security configuration error: Privileged role '{expected_role}' cannot be configured as EXPECTED_DB_RUNTIME_ROLE."
             )
 
+        # Validate storage backend across all environments
+        storage_backend = (self.STORAGE_BACKEND or "").strip().lower()
+        valid_storage_backends = {"memory", "local", "s3", "gcs"}
+        if storage_backend not in valid_storage_backends:
+            raise ValueError(
+                f"Storage configuration error: Unknown STORAGE_BACKEND '{self.STORAGE_BACKEND}'. "
+                f"Must be one of: {sorted(valid_storage_backends)}."
+            )
+
+        # Validate malware scanner type across all environments
+        scanner_type = (self.MALWARE_SCANNER_TYPE or "").strip().lower()
+        valid_scanner_types = {"mock", "clamav"}
+        if scanner_type not in valid_scanner_types:
+            raise ValueError(
+                f"Malware scanner configuration error: Unknown MALWARE_SCANNER_TYPE '{self.MALWARE_SCANNER_TYPE}'. "
+                f"Must be one of: {sorted(valid_scanner_types)}."
+            )
+
         if is_production:
             if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY == DEV_DEFAULT_JWT_SECRET:
                 raise ValueError(
@@ -105,6 +138,45 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"Production startup failed: EXPECTED_DB_RUNTIME_ROLE in production must be 'regulens_app', got '{expected_role}'."
                 )
+
+            # Strict production storage requirements (Package C)
+            if storage_backend in {"memory", "local"}:
+                raise ValueError(
+                    f"Production startup failed: Non-persistent storage backend '{storage_backend}' is strictly forbidden "
+                    "in production/staging environments. A persistent private cloud backend ('s3' or 'gcs') must be configured."
+                )
+
+            if storage_backend == "s3":
+                if not self.S3_USE_SSL:
+                    raise ValueError(
+                        "Production startup failed: S3_USE_SSL must be True in production/staging environments to enforce encrypted transport."
+                    )
+                if self.S3_ENDPOINT_URL and self.S3_ENDPOINT_URL.strip().lower().startswith("http://"):
+                    raise ValueError(
+                        "Production startup failed: Insecure HTTP endpoint URL is strictly forbidden in production/staging. S3_ENDPOINT_URL must use https://."
+                    )
+                if not (self.S3_BUCKET_NAME or "").strip():
+                    raise ValueError(
+                        "Production startup failed: S3_BUCKET_NAME must be explicitly configured."
+                    )
+
+            if storage_backend == "gcs":
+                if not (self.GCS_BUCKET_NAME or "").strip():
+                    raise ValueError(
+                        "Production startup failed: GCS_BUCKET_NAME must be explicitly configured."
+                    )
+
+            # Strict production malware scanner requirements (Package C)
+            if scanner_type == "mock":
+                raise ValueError(
+                    "Production startup failed: MockMalwareScanner is strictly forbidden in production/staging environments. "
+                    "A real, operational malware scanner (such as 'clamav') must be explicitly configured."
+                )
+            if scanner_type == "clamav":
+                if not (self.CLAMAV_HOST or "").strip():
+                    raise ValueError(
+                        "Production startup failed: CLAMAV_HOST must be explicitly configured for real malware scanning."
+                    )
         else:
             # Non-production: if bypass is requested, ensure environment is strictly 'development'
             if self.ALLOW_DEV_TENANT_BYPASS and env != "development":

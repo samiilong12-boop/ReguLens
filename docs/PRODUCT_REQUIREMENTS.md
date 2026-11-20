@@ -1,11 +1,21 @@
 # ReguLens — Product Requirements Document (PRD) (Multi-Sector Corrected)
 
 ## Document Status
-- **Current Phase:** Phase 1 — Minimal Technical Foundation
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Package A & Package B complete in Draft PRs; Package C pending)
 - **Approved Strategic Scope:** Multi-Sector Regulatory Intelligence Platform supporting:
   - **Sector 1: Agriculture and Agri-food** (Fresh oranges, fresh strawberries, frozen strawberries, fresh vegetables, processed food)
   - **Sector 2: Textiles and Apparel** (Ready-made garments, children's clothing, fabrics, home textiles)
-- **Provisional Test Case Status:** Fresh Egyptian Valencia Oranges (CN `0805 10 00`) to the European Union serves strictly as a **provisional engineering test case** for the first vertical slice to exercise multi-regime checks. It is NOT the entire product scope or a final commercial product decision. Commercial vertical selection remains subject to customer interviews and Comext trade evidence.
+- **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Formally approved by the founder as the first vertical slice to prove the end-to-end user journey across multi-regime checks (plant health, pesticide MRLs, official controls, preferential origin).
+- **Future Expansion Direction:** The broader multi-sector strategy (citrus + strawberries, ready-made garments, children's apparel) remains the overall product architecture and strategic expansion direction for Phase 3 and later, subject to post-slice customer interviews and Eurostat Comext trade evidence. Do not silently change the overall product strategy.
+- **Approved Acceptance Targets (Targets Approved by Founder; NOT Achieved Results):**
+  - Citation Validity: 100%
+  - Citation Support: ≥98%
+  - Requirement Extraction Precision: ≥95%
+  - Requirement Extraction Recall: ≥95%
+  - Unsupported-Claim Rate: 0%
+  - Source Freshness: 100% within defined freshness thresholds, otherwise a visible degraded-status warning.
+  - Golden Dataset: 25 curated, human-verified test cases.
+  *(Note: These are approved targets, NOT achieved results. They must be empirically measured on the golden dataset during Phase 2).*
 - **Mandatory Report Disclaimer (verbatim):**
   > "This report provides regulatory research and compliance-support information based on the sources and product information available at the time of generation. It is not an official government approval, certification, legal opinion or guarantee of market access. Requirements should be verified with the relevant authorities and qualified professionals."
 
@@ -41,7 +51,7 @@ ReguLens is a regulatory-intelligence and export-readiness assistance B2B SaaS p
 
 ---
 
-## 3. The 8-Step MVP User Journey (Provisional Test Case: Citrus)
+## 3. The 8-Step MVP User Journey (Selected First Vertical Slice: Fresh Egyptian Valencia Oranges to EU)
 
 ```mermaid
 sequenceDiagram
@@ -103,7 +113,7 @@ sequenceDiagram
 
 #### Step 4: Deterministic Requirement Retrieval
 - Evaluates declarative rules matching sector, HS code, origin, and attributes:
-  - **For Fresh Oranges (Provisional Test Case):**
+  - **For Fresh Oranges (Selected First Vertical Slice):**
     1. *Enhanced Official Controls:* Reg (EU) 2019/1793 Annex I (amended by Reg (EU) 2026/194). Single combined frequency of **10% for identity and physical checks**.
     2. *Documentary Checks:* Reg (EU) 2017/625 Art 54(1) requiring **100% documentary checks** [provisional citation].
     3. *Plant Health:* Reg (EU) 2016/2031 Art 71 & Reg (EU) 2019/2072 Annex XI. Mandatory Phytosanitary Certificate.

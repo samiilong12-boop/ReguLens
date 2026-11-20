@@ -255,19 +255,24 @@ class Document(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    consignment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    consignment_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
     document_type: Mapped[str] = mapped_column(String(64), nullable=False)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
-    sha256_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    antivirus_status: Mapped[str] = mapped_column(String(32), nullable=False, default="NOT_SCANNED")
+    sha256_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING_UPLOAD")
+    antivirus_status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    quarantine_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    uploaded_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     parsing_status: Mapped[str] = mapped_column(String(32), nullable=False, default="UPLOADED")
     extracted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    consignment: Mapped["Consignment"] = relationship("Consignment", back_populates="documents")
+    consignment: Mapped[Optional["Consignment"]] = relationship("Consignment", back_populates="documents")
     evidence_items: Mapped[List["EvidenceItem"]] = relationship("EvidenceItem", back_populates="document")
 
     __table_args__ = (
@@ -280,6 +285,7 @@ class Document(Base):
         ),
         Index("idx_documents_tenant", "tenant_id"),
         Index("idx_documents_consignment", "tenant_id", "consignment_id"),
+        Index("idx_documents_status", "tenant_id", "status"),
     )
 
 

@@ -48,6 +48,20 @@ async def lifespan(app: FastAPI):
                     error=str(conn_err),
                 )
 
+    # Verify storage security controls in production/staging environments
+    env = (settings.ENVIRONMENT or "").strip().lower()
+    if env in {"production", "prod", "staging"}:
+        from app.services.storage import get_storage_service, StorageSecurityError
+        try:
+            storage_svc = get_storage_service()
+            storage_status = storage_svc.verify_bucket_configuration()
+            logger.info("storage_security_verified", status=storage_status)
+        except Exception as storage_err:
+            logger.critical("storage_security_verification_failed", error=str(storage_err))
+            raise RuntimeError(
+                f"Production startup failed: Storage security verification failed: {storage_err}"
+            ) from storage_err
+
     yield
     logger.info("application_shutdown")
 
