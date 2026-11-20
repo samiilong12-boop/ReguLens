@@ -1,7 +1,7 @@
 # ReguLens — Test Strategy & Quality Verification Plan
 
 ## Document Status
-- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Package A & Package B complete in Draft PRs; Package C pending)
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Packages A, B, and C implemented in Draft PRs #1, #2, #3; Gate 1 unclosed pending external security review and founder sign-off)
 - **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Preserving broader multi-sector expansion (citrus + strawberries, apparel) for Phase 3 and beyond.
 - **Scope:** Complete Test Pyramid, Security Gates, Golden Dataset, and Expert Review Protocols
 - **Governance Reference:** `.agents/rules/QUALITY_GATES.md` (Sections 4, 6, 7) and `AGENTS.md`
@@ -108,6 +108,20 @@ In accordance with `QUALITY_GATES.md` (Section 6), automated security tests must
 ### 4.3. Prompt Injection Test Suite (`tests/security/test_prompt_injection.py`)
 - Executes the `AIProviderAdapter` against synthetic lab reports containing adversarial system override directives.
 - Asserts that the adapter outputs structured JSON conforming to the Pydantic schema and does not follow the adversarial directive.
+
+### 4.4. Package C Document Storage & Pipeline Security Test Suite (`tests/integration/test_document_lifecycle.py`, `tests/unit/test_storage_service.py`)
+- **Upload-Time Size Enforcement & Provider Policy Verification:**
+  - Tests S3 presigned POST generation includes `["content-length-range", 1, 26214400]` and exact object-key match condition `{"key": object_key}`.
+  - Verifies exact key matching matches expected key, rejects appended suffixes (`object_key + "/extra"`), and rejects alternate keys under tenant prefix.
+  - Verifies S3 presigned POST failure fails closed (`StorageSecurityError`), asserting no presigned PUT fallback is ever generated.
+  - Tests server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{id}/upload-content`) delegates to `StorageService.stream_upload_object()`, aborts mid-stream on exceeding 25MB, and purges partial quarantine uploads without memory accumulation.
+- **Migration Downgrade & Upgrade Lifecycle Verification:**
+  - Verifies bidirectional Alembic migration cycles (`0004` <-> `0003`) against real PostgreSQL 16.
+  - Asserts that teardown routines track all cleanup errors without silent exception swallowing, verifying record deletion, Alembic version restoration to `0004_document_storage_fields`, and schema column integrity with explicit `pytest.fail()` diagnostics.
+- **Testing & Mocking Boundaries:**
+  - Automated CI tests run against `MemoryStorageService` and `MockMalwareScanner`.
+  - Live AWS S3 / GCP GCS and live ClamAV require production credentials not present in CI.
+  - Automated tests do NOT substitute for an independent human penetration test and security audit.
 
 ---
 

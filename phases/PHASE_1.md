@@ -1,6 +1,6 @@
 # Phase 1: Minimal Technical Foundation
 
-**Gate 1 Status:** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); test suite expanded to 152 tests (73 unit tests, 22 integration tests, and 57 PostgreSQL 16 RLS security & migration tests); CI configuration disclosure documented; awaiting final founder sign-off.<br>
+**Gate 1 Status:** PARTIAL / READY FOR FOUNDER REVIEW — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); Gate 1 remains unclosed pending CI pipeline gap resolution, real cloud credential validation, external human security audit, and formal founder sign-off.<br>
 **Entry Condition:** Gate B status is READY FOR FOUNDER SIGN-OFF — final founder review pending.  
 **Read First:** `AGENTS.md`, `.agents/rules/TEAM_WORKFLOW.md`, `.agents/rules/QUALITY_GATES.md`, `phases/ROADMAP.md`, and the approved documents and ADRs from Phase 0B (`docs/PRODUCT_REQUIREMENTS.md`, `docs/SYSTEM_ARCHITECTURE.md`, `docs/DATABASE_SCHEMA.md`, `docs/SECURITY_ARCHITECTURE.md`, `docs/THREAT_MODEL.md`, `docs/TEST_STRATEGY.md`, `docs/adr/0002-multi-tenant-isolation-and-rls.md`, `docs/adr/0008-gcp-compatibility-and-security-preservation.md`). Do the start-of-session check.
 
@@ -30,7 +30,8 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
   - Pluggable storage abstraction (`StorageService` with `MemoryStorageService`, `LocalStorageService`, `S3StorageService`, and `GCSStorageService` per ADR 0008) isolating files by tenant under `tenants/{tenant_id}/quarantine/` and `tenants/{tenant_id}/documents/`.
   - Production fail-closed validation: startup checks reject in-memory/local storage and mock scanners in staging/production, requiring persistent private storage (`s3` or `gcs`) and real scanner (`clamav`).
   - Transport and private bucket controls: SSL strictly required in staging/production (`S3_USE_SSL=True`); insecure `http://` rejected; startup verification validates AWS PublicAccessBlock (all 4 flags True) or GCS Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
-  - Upload-time size enforcement: hard 25MB limit (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`) enforced via S3 presigned POST `content-length-range` condition; for GCS where signed PUT URLs cannot enforce content-length at provider boundary, `supports_direct_upload = False` and `initiate-upload` directs to authenticated server-mediated bounded streaming upload endpoint `POST /api/v1/documents/{id}/upload-content` with upload-time byte enforcement.
+  - Upload-time size enforcement: hard 25MB limit (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`) enforced via S3 presigned POST `content-length-range` condition and exact object-key match condition `{"key": object_key}`. Failures during presigned POST policy generation fail closed (`StorageSecurityError`), never falling back to unrestricted presigned PUT; for GCS where signed PUT URLs cannot enforce content-length at provider boundary, `supports_direct_upload = False` and `initiate-upload` directs to authenticated server-mediated bounded streaming upload endpoint `POST /api/v1/documents/{id}/upload-content` with upload-time byte enforcement.
+  - Bounded storage-level streaming write: `POST /api/v1/documents/{id}/upload-content` streams chunks directly to storage quarantine via `StorageService.stream_upload_object()`, enforcing byte limits per chunk with backpressure, aborting immediately upon exceeding 25MB, and purging partial quarantine objects on error without accumulating chunk lists in memory.
   - Pre-read memory exhaustion protection: finalization queries `get_object_metadata` *before* reading into memory; oversized objects are immediately purged from quarantine without buffering into RAM.
   - Server-side file validation (`file_validation.py`): magic-byte file signature validation (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`) and SHA-256 payload integrity hash verification.
   - Malware scanning subsystem (`scanner.py`): `BaseMalwareScanner`, `ClamAVScanner` connecting via streaming TCP protocol, and `MockMalwareScanner` detecting standard EICAR test string.
@@ -40,6 +41,7 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
   - Quarantine retention & cleanup (`cleanup.py`): tenant-scoped automated and CLI pruning (`purge_abandoned_quarantine_objects()`) for abandoned quarantine uploads older than 24 hours under PostgreSQL RLS and live `OWNER`/`ADMIN` role verification, preserving active uploads (< 24 hours).
   - Sanitized audit logging (`audit.py`): logs document upload, download URL generation, failure, deletion, and cleanup events while automatically redacting presigned URLs, query tokens, and authorization headers.
   - Alembic migration `0004_document_storage_fields.py` adding storage fields, nullable `consignment_id`, `idx_documents_status`, with safe downgrade guard preventing data loss on records with NULL `consignment_id` or `sha256_hash`.
+  - Migration cycle teardown verification: `tests/security/test_postgres_rls.py` eliminates silent exception swallowing, tracking all teardown errors and asserting record deletion, Alembic version restoration to `0004_document_storage_fields`, and schema column integrity with explicit `pytest.fail()` diagnostics.
   - Dedicated PostgreSQL 16 RLS security tests (57 tests total) executing as unprivileged `regulens_app` role (`NOBYPASSRLS`), proving cross-tenant document isolation, append-only audit log protection, and tenant-scoped quarantine cleanup isolation.
   - Implemented in `apps/api/app/services/`, `apps/api/app/api/v1/endpoints/documents.py`, `apps/api/alembic/versions/0004_document_storage_fields.py`; preserved in Draft PR #3.
 - **Automated Test Execution:**
@@ -58,6 +60,10 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
 - **Tenant Isolation Verification Scope (Distinguishing Catalog vs. Behavioral Testing):**
   - **Catalog Policy Verification:** Verified via `test_catalog_all_rls_policies_contain_nullif`, confirming that all 13 tenant policies and 2 user policies in PostgreSQL system catalogs (`pg_policies`) enforce `NULLIF`.
   - **Behavioral Isolation Tests:** Automated cross-tenant CRUD tests currently execute on: `products`, `consignments`, `documents`, `background_jobs`, `tenant_users`, and `tenants`. Other tenant-owned child tables (e.g., `consignment_items`, `document_analyses`) are protected by composite foreign keys and catalog policies, but do not yet have dedicated standalone behavioral CRUD isolation tests. Therefore, 100% behavioral isolation is NOT claimed across all tables.
+- **Mocked Test Services vs. Production Cloud Infrastructure:**
+  - CI and automated test suites execute against `MemoryStorageService` and `MockMalwareScanner`.
+  - Production deployment prerequisites (real AWS S3 / GCP GCS credentials, live ClamAV daemon container, SSL certificates) are deliberately not provisioned in Phase 1 per `AGENTS.md` Rule 8 (no cloud credentials or spend).
+  - The document pipeline is NOT claimed to be production-ready until verified against live cloud resources under founder supervision.
 
 ### 1.4. Founder Actions Still Pending
 - **Gate B Formal Approval:** Final founder written sign-off approving the Phase 0B deliverables, the first vertical slice, and the quantitative acceptance targets (`Requires founder action`).
@@ -102,7 +108,7 @@ Direct inspection of `.github/workflows/phase1-ci.yml` establishes the following
 |---|---|---|---|
 | **Package A** | Multi-Tenant RLS Session Context & GUC Enforcement | **COMPLETED** (In Draft PR #1) | `apps/api/app/db/session.py`, `apps/api/app/api/deps.py`, Alembic `0001` & `0002`, tests in `tests/security/test_tenant_isolation.py`. Draft PR #1 open, unmerged. |
 | **Package B** | Token-Bound Tenant Switching & Live Role Authorization | **COMPLETED** (In Draft PR #2) | `apps/api/app/api/v1/endpoints/auth.py`, `apps/api/app/api/deps.py`, Alembic `0003`, integration tests in `tests/integration/test_fastapi_tenant_authorization.py`, migration cycle test `tests/test_migrations.py`. CI Run #43624757872 (82 passed, 0 failed). Draft PR #2 open, unmerged. |
-| **Package C** | Private File Storage Pipeline & Upload Security | **COMPLETED** (In Draft PR #3) | `apps/api/app/services/storage.py`, `file_validation.py`, `scanner.py`, `audit.py`, `endpoints/documents.py`, Alembic `0004`, 21 integration tests in `tests/integration/test_document_lifecycle.py`, 4 unit test suites. Draft PR #3 open, unmerged. |
+| **Package C** | Private File Storage Pipeline & Upload Security | **IMPLEMENTED IN DRAFT PR #3** (Security remediations applied; awaiting cloud credentials, external security audit, and founder sign-off) | `apps/api/app/services/storage.py`, `file_validation.py`, `scanner.py`, `audit.py`, `endpoints/documents.py`, Alembic `0004`, 22 integration tests in `tests/integration/test_document_lifecycle.py`, 4 unit test suites. Draft PR #3 open, unmerged. |
 
 ---
 

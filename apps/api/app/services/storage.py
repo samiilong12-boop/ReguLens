@@ -112,6 +112,22 @@ class StorageService(ABC):
         pass
 
     @abstractmethod
+    async def stream_upload_object(
+        self,
+        object_key: str,
+        stream: Any,
+        max_bytes: int,
+        content_type: Optional[str] = None,
+    ) -> int:
+        """Streams upload payload directly to quarantine storage with bounded backpressure.
+
+        Enforces hard byte limit on every received chunk and aborts immediately without
+        buffering entire payload into memory. Automatically cleans up partial uploads on error.
+        Returns total bytes written.
+        """
+        pass
+
+    @abstractmethod
     def delete_object(self, object_key: str) -> bool:
         """Deletes an object from storage if it exists."""
         pass
@@ -214,6 +230,47 @@ class MemoryStorageService(StorageService):
         with self._lock:
             ct = content_type or "application/octet-stream"
             self._objects[object_key] = (data, ct, datetime.now(timezone.utc))
+
+    async def stream_upload_object(
+        self,
+        object_key: str,
+        stream: Any,
+        max_bytes: int,
+        content_type: Optional[str] = None,
+    ) -> int:
+        buf = bytearray()
+        total_bytes = 0
+        limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
+
+        try:
+            if hasattr(stream, "__aiter__"):
+                async for chunk in stream:
+                    total_bytes += len(chunk)
+                    if total_bytes > limit:
+                        raise StoragePayloadTooLargeError(
+                            f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                        )
+                    buf.extend(chunk)
+            else:
+                for chunk in stream:
+                    total_bytes += len(chunk)
+                    if total_bytes > limit:
+                        raise StoragePayloadTooLargeError(
+                            f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                        )
+                    buf.extend(chunk)
+
+            if total_bytes == 0:
+                raise ValueError("Uploaded stream payload is empty (0 bytes).")
+
+            with self._lock:
+                ct = content_type or "application/octet-stream"
+                self._objects[object_key] = (bytes(buf), ct, datetime.now(timezone.utc))
+            return total_bytes
+        except Exception:
+            with self._lock:
+                self._objects.pop(object_key, None)
+            raise
 
     def delete_object(self, object_key: str) -> bool:
         with self._lock:
@@ -333,6 +390,58 @@ class LocalStorageService(StorageService):
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(data)
 
+    async def stream_upload_object(
+        self,
+        object_key: str,
+        stream: Any,
+        max_bytes: int,
+        content_type: Optional[str] = None,
+    ) -> int:
+        final_path = self._resolve_key(object_key)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = final_path.parent / f".tmp_{uuid4().hex}"
+        total_bytes = 0
+        limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
+
+        try:
+            with open(temp_path, "wb") as f:
+                if hasattr(stream, "__aiter__"):
+                    async for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+                else:
+                    for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+
+            if total_bytes == 0:
+                if temp_path.exists():
+                    temp_path.unlink()
+                raise ValueError("Uploaded stream payload is empty (0 bytes).")
+
+            temp_path.replace(final_path)
+            return total_bytes
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            if final_path.exists():
+                try:
+                    final_path.unlink()
+                except OSError:
+                    pass
+            raise
+
     def delete_object(self, object_key: str) -> bool:
         file_path = self._resolve_key(object_key)
         if file_path.exists() and file_path.is_file():
@@ -427,11 +536,11 @@ class S3StorageService(StorageService):
         content_type: Optional[str] = None,
         max_size_bytes: int = 25 * 1024 * 1024,
     ) -> PresignedUrlInfo:
-        """Generates presigned upload with provider policy enforcing content-length-range."""
+        """Generates presigned upload with provider policy enforcing content-length-range and exact object key."""
         client = self._get_client()
         conditions = [
             ["content-length-range", 1, max_size_bytes],
-            ["starts-with", "$key", object_key],
+            {"key": object_key},
         ]
         fields = {}
         if content_type:
@@ -453,24 +562,16 @@ class S3StorageService(StorageService):
                 headers={},
                 fields=post_data["fields"],
             )
-        except Exception:
-            # Fallback to PUT URL if provider does not support presigned POST
-            params = {"Bucket": self.bucket_name, "Key": object_key}
-            if content_type:
-                params["ContentType"] = content_type
-            url = client.generate_presigned_url(
-                ClientMethod="put_object",
-                Params=params,
-                ExpiresIn=expires_in_seconds,
-                HttpMethod="PUT",
+        except Exception as e:
+            logger.error(
+                "s3_presigned_post_generation_failed",
+                bucket=self.bucket_name,
+                object_key=object_key,
+                error=str(e),
             )
-            return PresignedUrlInfo(
-                url=url,
-                expires_in_seconds=expires_in_seconds,
-                method="PUT",
-                headers={"Content-Type": content_type} if content_type else {},
-                fields={},
-            )
+            raise StorageSecurityError(
+                f"Failed to generate secure S3 presigned POST policy with upload-time size enforcement for object '{object_key}': {e}"
+            ) from e
 
     def generate_presigned_download_url(
         self,
@@ -530,6 +631,61 @@ class S3StorageService(StorageService):
         if content_type:
             params["ContentType"] = content_type
         client.put_object(**params)
+
+    async def stream_upload_object(
+        self,
+        object_key: str,
+        stream: Any,
+        max_bytes: int,
+        content_type: Optional[str] = None,
+    ) -> int:
+        import tempfile
+        client = self._get_client()
+        total_bytes = 0
+        limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_path = Path(temp_file.name)
+        try:
+            with open(temp_path, "wb") as f:
+                if hasattr(stream, "__aiter__"):
+                    async for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+                else:
+                    for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+
+            if total_bytes == 0:
+                raise ValueError("Uploaded stream payload is empty (0 bytes).")
+
+            with open(temp_path, "rb") as f:
+                params = {"Bucket": self.bucket_name, "Key": object_key, "Body": f}
+                if content_type:
+                    params["ContentType"] = content_type
+                client.put_object(**params)
+            return total_bytes
+        except Exception:
+            try:
+                self.delete_object(object_key)
+            except Exception:
+                pass
+            raise
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     def delete_object(self, object_key: str) -> bool:
         client = self._get_client()
@@ -696,6 +852,60 @@ class GCSStorageService(StorageService):
         bucket = client.bucket(self.bucket_name)
         blob = bucket.blob(object_key)
         blob.upload_from_string(data, content_type=content_type)
+
+    async def stream_upload_object(
+        self,
+        object_key: str,
+        stream: Any,
+        max_bytes: int,
+        content_type: Optional[str] = None,
+    ) -> int:
+        import tempfile
+        client = self._get_client()
+        bucket = client.bucket(self.bucket_name)
+        blob = bucket.blob(object_key)
+        total_bytes = 0
+        limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_path = Path(temp_file.name)
+        try:
+            with open(temp_path, "wb") as f:
+                if hasattr(stream, "__aiter__"):
+                    async for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+                else:
+                    for chunk in stream:
+                        total_bytes += len(chunk)
+                        if total_bytes > limit:
+                            raise StoragePayloadTooLargeError(
+                                f"Uploaded stream exceeded maximum permitted limit of {limit} bytes."
+                            )
+                        f.write(chunk)
+
+            if total_bytes == 0:
+                raise ValueError("Uploaded stream payload is empty (0 bytes).")
+
+            blob.upload_from_filename(str(temp_path), content_type=content_type)
+            return total_bytes
+        except Exception:
+            try:
+                if blob.exists():
+                    blob.delete()
+            except Exception:
+                pass
+            raise
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     def delete_object(self, object_key: str) -> bool:
         client = self._get_client()

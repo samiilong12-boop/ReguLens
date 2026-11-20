@@ -110,7 +110,7 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
   The `StorageService` interface (`apps/api/app/services/storage.py`) provides backend-agnostic storage operations with concrete implementations:
   - `MemoryStorageService`: In-memory dictionary storage with size enforcement for fast, isolated unit and integration testing. Strictly prohibited in staging/production.
   - `LocalStorageService`: Filesystem storage with strict path-traversal prevention for local development. Strictly prohibited in staging/production.
-  - `S3StorageService`: AWS S3 / MinIO cloud object storage with enforced HTTPS/SSL (`S3_USE_SSL=True`), presigned POST upload policies with `content-length-range` condition, and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
+  - `S3StorageService`: AWS S3 / MinIO cloud object storage with enforced HTTPS/SSL (`S3_USE_SSL=True`), presigned POST upload policies with `content-length-range` condition and exact object-key match condition (`{"key": object_key}`), fail-closed handling on error (raising `StorageSecurityError` without presigned PUT fallback), and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
   - `GCSStorageService`: Google Cloud Storage adapter (GCP compatibility per ADR 0008) supporting signed URLs, bounded streaming reads, and startup verification of Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
 
 - **Production Fail-Closed Configuration:**
@@ -125,8 +125,8 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
      - System validates declared MIME type against allowed whitelist (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`).
      - Server allocates a cryptographically random UUID and stores the file under an isolated quarantine prefix: `tenants/{tenant_id}/quarantine/{uuid}`.
      - Document record is created in the database with status `PENDING_VALIDATION` and `quarantine_key` populated.
-     - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds). For S3, presigned POST policy conditions restrict upload size to `[1, 26214400]` bytes.
-     - For GCS, direct presigned uploads are disabled (`supports_direct_upload = False`) because GCS signed PUT URLs cannot enforce upload-time size policies at the provider boundary. GCS uploads use the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`) which enforces the 25MB ceiling on headers and incoming byte chunks before storage writes.
+     - A short-lived presigned upload URL is generated with an expiration lifetime of **15 minutes** (900 seconds). For S3, presigned POST policy conditions restrict upload size to `[1, 26214400]` bytes and enforce exact object-key match (`{"key": object_key}`), strictly preventing suffix appendages or key hijacking. Failures during presigned POST policy generation fail closed (`StorageSecurityError`), never falling back to unrestricted presigned PUT.
+     - For GCS, direct presigned uploads are disabled (`supports_direct_upload = False`) because GCS signed PUT URLs cannot enforce upload-time size policies at the provider boundary. GCS uploads use the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`). This endpoint delegates to the bounded streaming-write interface on `StorageService` (`stream_upload_object()`), which streams chunks with backpressure directly to quarantine, enforces hard byte ceilings per chunk, aborts immediately upon exceeding 25MB without accumulating chunk lists in memory, and purges partial quarantine uploads on error.
   2. **Phase 2: Upload Finalization & Validation (`POST /api/v1/documents/{id}/finalize-upload`):**
      - Client confirms upload completion with expected SHA-256 hash.
      - **Pre-Read Memory Exhaustion Protection:** The server queries `get_object_metadata` from storage *before* reading the object payload into memory. If the quarantined object exceeds the hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`), the file is immediately purged from quarantine, an audit event is emitted, and HTTP 400 is returned without buffering the oversized object into RAM.
@@ -167,6 +167,12 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
 - **Sanitized Audit Trail:**
   - All file lifecycle events (`DOCUMENT_UPLOAD_INITIATED`, `DOCUMENT_UPLOAD_FINALIZED`, `DOCUMENT_UPLOAD_FAILED`, `DOCUMENT_DOWNLOAD_URL_GENERATED`, `DOCUMENT_DELETED`, `DOCUMENT_QUARANTINE_PURGED`) are emitted to `audit_logs`.
   - Presigned URLs, query tokens, and authorization headers are automatically redacted prior to log persistence.
+
+- **Package C Implementation & Security Readiness Status:**
+  - **Implemented & CI-Verified:** Provider-agnostic `StorageService` interface, S3 presigned POST exact-key policy and fail-closed posture, GCS server-mediated upload mode, bounded streaming-write interface (`stream_upload_object`), magic-byte inspection (`file_validation.py`), ClamAV TCP streaming protocol, tenant-scoped quarantine cleanup under PostgreSQL RLS, and append-only sanitized audit logging.
+  - **Mocked in CI/Dev:** Unit and integration test suites execute using `MemoryStorageService` and `MockMalwareScanner` to provide fast, hermetic, credential-free execution in CI.
+  - **Production Prerequisites:** Deployment to live staging or production requires real cloud provider credentials (AWS IAM role / GCP service account), provisioned private storage buckets with verified public access blocks, and a running ClamAV daemon container.
+  - **External Audit Requirement:** In accordance with `AGENTS.md` Rule 12 and `QUALITY_GATES.md`, automated agent self-reviews and CI passes do not constitute independent external security audits. An external human penetration test and security audit is required before commercial reliance. Package C is preserved in Draft PR #3 and is NOT marked completed or production-ready.
 
 ### 3.5. AI & Prompt Boundary Security
 Per `AGENTS.md` Rule 6:

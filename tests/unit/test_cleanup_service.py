@@ -9,7 +9,7 @@ from app.services.cleanup import purge_abandoned_quarantine_objects, CleanupRepo
 from app.services.storage import MemoryStorageService
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_purge_abandoned_quarantine_objects_success():
     """Cleanup service purges expired quarantine objects (>24h) and preserves active uploads (<24h)."""
     storage = MemoryStorageService()
@@ -108,7 +108,7 @@ async def test_purge_abandoned_quarantine_objects_success():
     mock_session.commit.assert_awaited_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_purge_input_validation():
     """Validates input constraints on cutoff_hours, tenant_id, and actor_user_id."""
     mock_session = AsyncMock()
@@ -156,7 +156,7 @@ async def test_purge_input_validation():
         )
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_purge_authorization_and_role_checks():
     """Validates role-based authorization: rejects inactive users, non-members, and VIEWER roles."""
     mock_session = AsyncMock()

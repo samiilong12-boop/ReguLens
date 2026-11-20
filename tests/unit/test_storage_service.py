@@ -120,19 +120,20 @@ def test_storage_size_enforcement_in_memory_and_local():
 
 
 def test_s3_storage_presigned_post_content_length_range():
-    """S3 upload generation must enforce upload-time content-length-range policy conditions."""
+    """S3 upload generation must enforce upload-time content-length-range and exact key policy conditions."""
     mock_boto = MagicMock()
     mock_client = MagicMock()
+    expected_key = "tenants/t1/quarantine/uuid1"
     mock_client.generate_presigned_post.return_value = {
         "url": "https://s3.amazonaws.com/test-bucket",
-        "fields": {"key": "tenants/t1/quarantine/uuid1", "policy": "xyz=="},
+        "fields": {"key": expected_key, "policy": "xyz=="},
     }
     mock_boto.client.return_value = mock_client
 
     with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
         s3 = S3StorageService(bucket_name="test-bucket", use_ssl=True)
         info = s3.generate_presigned_upload_url(
-            object_key="tenants/t1/quarantine/uuid1",
+            object_key=expected_key,
             content_type="application/pdf",
             max_size_bytes=26214400,
         )
@@ -141,10 +142,107 @@ def test_s3_storage_presigned_post_content_length_range():
         assert info.url == "https://s3.amazonaws.com/test-bucket"
         assert info.fields["policy"] == "xyz=="
 
-        # Assert content-length-range was passed in conditions
+        # Assert content-length-range and exact key was passed in conditions
         calls = mock_client.generate_presigned_post.call_args
         conditions = calls[1]["Conditions"]
         assert ["content-length-range", 1, 26214400] in conditions
+        assert {"key": expected_key} in conditions
+        # Assert starts-with is NOT used for key (to prevent suffix appended keys)
+        assert not any(isinstance(c, list) and len(c) > 1 and c[0] == "starts-with" and c[1] == "$key" for c in conditions)
+
+        # Policy condition simulation: verify exact-match behavior vs suffix / alternate keys
+        def validate_policy_key(conds, candidate_key):
+            for c in conds:
+                if isinstance(c, dict) and "key" in c:
+                    return c["key"] == candidate_key
+                elif isinstance(c, list) and len(c) == 3 and c[0] == "eq" and c[1] == "$key":
+                    return c[2] == candidate_key
+            return False
+
+        # Exact key succeeds
+        assert validate_policy_key(conditions, expected_key) is True
+        # Appended suffix is rejected by exact-match policy
+        assert validate_policy_key(conditions, expected_key + "/extra") is False
+        assert validate_policy_key(conditions, expected_key + ".png") is False
+        # Alternate key under same tenant prefix is rejected
+        assert validate_policy_key(conditions, "tenants/t1/quarantine/different_uuid") is False
+
+
+def test_s3_storage_presigned_post_failure_fails_closed():
+    """When S3 presigned POST generation fails, it must fail closed and NEVER fall back to presigned PUT."""
+    mock_boto = MagicMock()
+    mock_client = MagicMock()
+    mock_client.generate_presigned_post.side_effect = RuntimeError("AWS S3 Presigned POST Generation Failed")
+    mock_boto.client.return_value = mock_client
+
+    with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
+        s3 = S3StorageService(bucket_name="test-bucket", use_ssl=True)
+        with pytest.raises(StorageSecurityError, match="Failed to generate secure S3 presigned POST policy"):
+            s3.generate_presigned_upload_url(
+                object_key="tenants/t1/quarantine/uuid1",
+                content_type="application/pdf",
+                max_size_bytes=26214400,
+            )
+
+        # Invariant: No presigned PUT URL was ever generated or attempted
+        assert mock_client.generate_presigned_url.called is False
+
+
+def test_storage_service_streaming_upload_bounded_and_cleanup(tmp_path):
+    """Storage stream_upload_object must stream chunks with byte ceiling and purge partial data on error."""
+    # Helper to drive coroutine without async event loop socketpair
+    def run_sync(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    # 1. MemoryStorageService
+    mem = MemoryStorageService()
+    mem_key = "tenants/t1/quarantine/mem_doc"
+
+    # 1a. Successful bounded stream
+    chunks = [b"chunk1_", b"chunk2_", b"chunk3"]
+    total = run_sync(mem.stream_upload_object(mem_key, iter(chunks), max_bytes=100))
+    assert total == len(b"chunk1_chunk2_chunk3")
+    assert mem.get_object(mem_key) == b"chunk1_chunk2_chunk3"
+
+    # 1b. Exceeding max_bytes aborts immediately and purges partial object
+    overflow_key = "tenants/t1/quarantine/overflow"
+    with pytest.raises(StoragePayloadTooLargeError, match="exceeded maximum permitted limit"):
+        run_sync(mem.stream_upload_object(overflow_key, iter([b"A" * 50, b"B" * 60]), max_bytes=100))
+    assert not mem.object_exists(overflow_key)
+
+    # 1c. Empty stream raises ValueError and leaves no object
+    empty_key = "tenants/t1/quarantine/empty"
+    with pytest.raises(ValueError, match="empty"):
+        run_sync(mem.stream_upload_object(empty_key, iter([]), max_bytes=100))
+    assert not mem.object_exists(empty_key)
+
+    # 2. LocalStorageService
+    local = LocalStorageService(base_path=str(tmp_path / "storage"))
+    local_key = "tenants/t1/quarantine/local_doc"
+
+    # 2a. Successful bounded stream
+    total_loc = run_sync(local.stream_upload_object(local_key, iter(chunks), max_bytes=100))
+    assert total_loc == len(b"chunk1_chunk2_chunk3")
+    assert local.get_object(local_key) == b"chunk1_chunk2_chunk3"
+
+    # 2b. Exceeding max_bytes aborts immediately and cleans up temporary and final files
+    loc_overflow_key = "tenants/t1/quarantine/loc_overflow"
+    with pytest.raises(StoragePayloadTooLargeError, match="exceeded maximum permitted limit"):
+        run_sync(local.stream_upload_object(loc_overflow_key, iter([b"X" * 60, b"Y" * 50]), max_bytes=100))
+    assert not local.object_exists(loc_overflow_key)
+    # Ensure no leftover temp files exist in the quarantine directory
+    quarantine_dir = tmp_path / "storage" / "tenants" / "t1" / "quarantine"
+    temp_files = list(quarantine_dir.glob(".tmp_*"))
+    assert len(temp_files) == 0, f"Found leaked temp files: {temp_files}"
+
+    # 2c. Empty stream raises ValueError
+    loc_empty_key = "tenants/t1/quarantine/loc_empty"
+    with pytest.raises(ValueError, match="empty"):
+        run_sync(local.stream_upload_object(loc_empty_key, iter([]), max_bytes=100))
+    assert not local.object_exists(loc_empty_key)
 
 
 def test_s3_storage_verify_bucket_configuration():

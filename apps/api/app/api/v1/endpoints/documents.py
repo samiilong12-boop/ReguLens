@@ -28,7 +28,12 @@ from app.schemas.document import (
 from app.services.audit import log_document_audit_event
 from app.services.file_validation import validate_file_content
 from app.services.scanner import ScanStatus, get_malware_scanner
-from app.services.storage import generate_tenant_object_key, get_storage_service
+from app.services.storage import (
+    generate_tenant_object_key,
+    get_storage_service,
+    StoragePayloadTooLargeError,
+    StorageSecurityError,
+)
 
 router = APIRouter()
 
@@ -105,17 +110,24 @@ async def initiate_upload(
         upload_fields = None
         expires_in = 900
     else:
-        presigned = storage_service.generate_presigned_upload_url(
-            object_key=quarantine_key,
-            expires_in_seconds=900,
-            content_type=payload.claimed_mime_type,
-            max_size_bytes=min(payload.expected_size_bytes, settings.MAX_DOCUMENT_SIZE_BYTES),
-        )
-        upload_mode = "direct"
-        upload_url = presigned.url
-        upload_method = presigned.method
-        upload_fields = presigned.fields or None
-        expires_in = presigned.expires_in_seconds
+        try:
+            presigned = storage_service.generate_presigned_upload_url(
+                object_key=quarantine_key,
+                expires_in_seconds=900,
+                content_type=payload.claimed_mime_type,
+                max_size_bytes=min(payload.expected_size_bytes, settings.MAX_DOCUMENT_SIZE_BYTES),
+            )
+            upload_mode = "direct"
+            upload_url = presigned.url
+            upload_method = presigned.method
+            upload_fields = presigned.fields or None
+            expires_in = presigned.expires_in_seconds
+        except StorageSecurityError as e:
+            logger.error("presigned_upload_generation_failed", error=str(e), key=quarantine_key)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Secure upload policy generation failed: {e}",
+            )
 
     # Log immutable audit event
     ip = request.client.host if request.client else None
@@ -206,28 +218,34 @@ async def upload_document_content(
         except ValueError:
             pass
 
-    # 3. Stream chunks with hard byte count ceiling
+    # 3. Stream chunks with hard byte count ceiling and bounded storage-level streaming
     max_limit = settings.MAX_DOCUMENT_SIZE_BYTES
-    chunks = []
-    total_bytes = 0
-
-    async for chunk in request.stream():
-        total_bytes += len(chunk)
-        if total_bytes > max_limit:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Uploaded stream exceeded maximum permitted limit of {max_limit} bytes.",
-            )
-        chunks.append(chunk)
-
-    if total_bytes == 0:
+    try:
+        total_bytes = await storage_service.stream_upload_object(
+            object_key=document.quarantine_key,
+            stream=request.stream(),
+            max_bytes=max_limit,
+            content_type=document.mime_type,
+        )
+    except StoragePayloadTooLargeError as e:
+        storage_service.delete_object(document.quarantine_key)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded stream payload is empty (0 bytes).",
+            detail=str(e),
+        )
+    except ValueError as e:
+        storage_service.delete_object(document.quarantine_key)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        storage_service.delete_object(document.quarantine_key)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Upload streaming failed: {e}",
         )
 
-    data = b"".join(chunks)
-    storage_service.put_object(document.quarantine_key, data, content_type=document.mime_type)
     document.file_size_bytes = total_bytes
     await db.commit()
     await db.refresh(document)

@@ -1,7 +1,7 @@
 # ReguLens — System Architecture Document (Multi-Sector Corrected)
 
 ## Document Status
-- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Package A & Package B complete in Draft PRs; Package C pending)
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Packages A, B, and C implemented in Draft PRs #1, #2, #3; Gate 1 unclosed pending external security review and founder sign-off)
 - **Strategic Scope:** Multi-Sector Architecture supporting both **Sector 1 (Agriculture & Agri-food)** and **Sector 2 (Textiles & Apparel)** as the long-term platform vision.
 - **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Formally approved by the founder as the first vertical slice to prove end-to-end multi-regime regulatory discovery, gap analysis, and dossier compilation. The multi-sector strategy is preserved as the strategic expansion path for Phase 3 and beyond, subject to exporter validation and trade data.
 - **Approved Acceptance Targets (Targets Approved by Founder; NOT Achieved Results):**
@@ -110,7 +110,7 @@ graph TD
 - **Storage Abstraction:** Provider-independent `StorageService` interface implemented across:
   - `MemoryStorageService`: In-memory dictionary storage with size checking for fast, isolated CI testing.
   - `LocalStorageService`: Development filesystem storage with strict path-traversal prevention.
-  - `S3StorageService`: AWS S3 / MinIO object storage with mandatory SSL in production, presigned POST upload policies with `content-length-range` enforcement, and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
+  - `S3StorageService`: AWS S3 / MinIO object storage with mandatory SSL in production, presigned POST upload policies with `content-length-range` enforcement and exact object-key condition `{"key": object_key}`, fail-closed handling on error (raising `StorageSecurityError` without presigned PUT fallback), and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
   - `GCSStorageService`: Google Cloud Storage adapter (GCP compatibility per ADR 0008) supporting signed URLs, bounded streaming reads, and verification of Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
 - **Private Storage Invariant:** 100% private bucket; zero public ACLs or public URLs. All client upload and download access operates exclusively through short-lived presigned URLs (15-minute expiry) or bounded API endpoints.
 - **Transport Security:** Production and staging environments strictly require HTTPS/SSL (`S3_USE_SSL=True`); insecure `http://` endpoint URLs raise fail-closed configuration errors at startup.
@@ -119,7 +119,7 @@ graph TD
   - Permanent: `tenants/{tenant_id}/documents/{opaque_uuid}`
 - **Upload Size Enforcement & Memory Exhaustion Protection:**
   - Hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
-  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; for GCS where signed PUT URLs cannot enforce content-length policies at the provider boundary, `supports_direct_upload = False` and clients are directed to the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`) which enforces byte bounds on Content-Length headers and streaming chunks before writing to quarantine.
+  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; for GCS where signed PUT URLs cannot enforce content-length policies at the provider boundary, `supports_direct_upload = False` and clients are directed to the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`). This endpoint delegates directly to the bounded streaming-write interface on `StorageService` (`stream_upload_object`), which enforces byte limits per chunk with backpressure, aborts immediately upon exceeding 25MB without memory accumulation, and purges partial quarantine uploads on error.
   - During finalization, server inspects object metadata (`get_object_metadata`) to verify size *before* reading payload into memory, preventing memory exhaustion (DoS). Oversized objects in quarantine are safely deleted and rejected with HTTP 400.
 - **Two-Phase Upload Lifecycle:**
   1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues an upload transport payload (direct S3 presigned URL or server-mediated `/upload-content` endpoint with 15-minute expiry).

@@ -1342,3 +1342,85 @@ async def test_scenario_21_gcs_server_mediated_upload_rejects_oversized_payload(
     finally:
         # Restore default storage service
         set_storage_service(ctx["storage"])
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_22_s3_presigned_post_failure_fails_closed_and_bounded_streaming(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 22: S3 presigned POST generation fails closed without PUT fallback, and bounded streaming enforces byte limit mid-stream."""
+    from unittest.mock import MagicMock, patch
+    from app.services.storage import S3StorageService, StorageSecurityError
+
+    client = document_test_client
+    ctx = document_test_context
+    token_a = ctx["token_a"]
+
+    # 1. S3 Storage Service fail closed when presigned POST fails
+    mock_boto = MagicMock()
+    mock_s3_client = MagicMock()
+    mock_s3_client.generate_presigned_post.side_effect = RuntimeError("AWS Connection Failure")
+    mock_boto.client.return_value = mock_s3_client
+
+    with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
+        s3 = S3StorageService(bucket_name="test-s3-bucket", use_ssl=True)
+        set_storage_service(s3)
+
+        try:
+            # Attempting to initiate upload when presigned POST fails must fail closed
+            init_res = await client.post(
+                "/api/v1/documents/initiate-upload",
+                json={
+                    "file_name": "s3_fail.pdf",
+                    "expected_size_bytes": 1024,
+                    "claimed_mime_type": "application/pdf",
+                    "document_type": "PHYTOSANITARY_CERTIFICATE",
+                },
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            # Must return 500 error, never a 201 with an unrestricted presigned PUT
+            assert init_res.status_code == 500
+            assert "Failed to generate secure S3 presigned POST policy" in init_res.json()["detail"]
+            assert mock_s3_client.generate_presigned_url.called is False
+        finally:
+            set_storage_service(ctx["storage"])
+
+    # 2. Mid-stream byte ceiling without Content-Length header
+    # Initiate a document under default storage
+    init_res2 = await client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "chunked_overflow.pdf",
+            "expected_size_bytes": 1024,
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PHYTOSANITARY_CERTIFICATE",
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res2.status_code == 201
+    doc_id2 = init_res2.json()["document_id"]
+    q_key2 = init_res2.json()["quarantine_key"]
+
+    # Stream chunks where total exceeds 25MB (e.g. 26MB) via async generator
+    async def oversized_stream():
+        # 26 chunks of 1MB each = 26MB > 25MB limit
+        chunk = b"A" * (1024 * 1024)
+        for _ in range(26):
+            yield chunk
+
+    stream_res = await client.post(
+        f"/api/v1/documents/{doc_id2}/upload-content",
+        content=oversized_stream(),
+        headers={
+            "Authorization": f"Bearer {token_a}",
+            "Content-Type": "application/pdf",
+            # Transfer-Encoding chunked / no Content-Length header
+        },
+    )
+    assert stream_res.status_code == 400
+    assert "exceeded maximum permitted limit" in stream_res.json()["detail"]
+
+    # Invariant: Partial object is purged from storage quarantine
+    storage = ctx["storage"]
+    assert not storage.object_exists(q_key2)

@@ -2128,7 +2128,7 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         assert m_row.role == "OWNER"
 
     finally:
-        # Cleanup test data and ensure database is restored to 0003 head even if an assertion failed
+        teardown_errors = []
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -2144,14 +2144,37 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
                 {"id": str(test_user_id)},
             )
             await admin_session.commit()
-        except Exception:
+
+            # Verify deletion
+            verify_del = await admin_session.execute(
+                text("SELECT count(*) FROM users WHERE id = :id"),
+                {"id": str(test_user_id)},
+            )
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test user {test_user_id}")
+        except Exception as e:
             await admin_session.rollback()
+            teardown_errors.append(f"Error during record cleanup in test_migration_0003: {e}")
 
         # Ensure alembic is restored to head
         try:
-            await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-        except Exception:
-            pass
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0004_document_storage_fields":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0004_document_storage_fields":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version in test_migration_0003: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0003_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
 
 
 # ============================================================================
@@ -2267,13 +2290,39 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         assert cols_restored["sha256_hash"] == "YES"
 
     finally:
-        # Restore to head
+        teardown_errors = []
         try:
             res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-            if res_cur.scalar() != "0004_document_storage_fields":
+            cur_version = res_cur.scalar()
+            if cur_version != "0004_document_storage_fields":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-        except Exception:
-            pass
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0004_document_storage_fields":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                    )
+
+            # Verify schema integrity (Package C columns restored on documents table)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key', 'uploaded_by_user_id', 'rejection_reason', 'validated_at');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            expected_cols = {'status', 'quarantine_key', 'uploaded_by_user_id', 'rejection_reason', 'validated_at'}
+            if restored_cols != expected_cols:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: restored columns {restored_cols} != expected {expected_cols}"
+                )
+        except Exception as e:
+            teardown_errors.append(f"Error during Alembic restoration/verification in teardown: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
 
 
 # ============================================================================
@@ -2364,6 +2413,18 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
                     teardown_errors.append(
                         f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
                     )
+
+            # Verify schema integrity (Package C columns restored)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            if restored_cols != {'status', 'quarantine_key'}:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: {restored_cols} != {{'status', 'quarantine_key'}}"
+                )
         except Exception as e:
             teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
 
@@ -2455,6 +2516,18 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
                     teardown_errors.append(
                         f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
                     )
+
+            # Verify schema integrity (Package C columns restored)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            if restored_cols != {'status', 'quarantine_key'}:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: {restored_cols} != {{'status', 'quarantine_key'}}"
+                )
         except Exception as e:
             teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
 
