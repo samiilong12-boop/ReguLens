@@ -1355,7 +1355,7 @@ async def test_scenario_22_s3_presigned_post_failure_fails_closed_and_bounded_st
 
     client = document_test_client
     ctx = document_test_context
-    token_a = ctx["token_a"]
+    token_a = ctx["tokens"]["compliance_a"]
 
     # 1. S3 Storage Service fail closed when presigned POST fails
     mock_boto = MagicMock()
