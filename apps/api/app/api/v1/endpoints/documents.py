@@ -34,6 +34,9 @@ from app.services.storage import (
     StoragePayloadTooLargeError,
     StorageSecurityError,
 )
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
