@@ -45,8 +45,8 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
   - Dedicated PostgreSQL 16 RLS security tests (57 tests total) executing as unprivileged `regulens_app` role (`NOBYPASSRLS`), proving cross-tenant document isolation, append-only audit log protection, and tenant-scoped quarantine cleanup isolation.
   - Implemented in `apps/api/app/services/`, `apps/api/app/api/v1/endpoints/documents.py`, `apps/api/alembic/versions/0004_document_storage_fields.py`; preserved in Draft PR #3.
 - **Automated Test Execution:**
-  - 152 total tests passing locally: 73 unit tests, 22 integration tests, 57 PostgreSQL 16 RLS security and migration cycle tests.
-  - 100% pass rate with zero skips and zero failures.
+  - 155 total tests passing in GitHub Actions CI (run 44782179656): 76 unit tests, 22 integration tests, 57 PostgreSQL 16 RLS security and migration cycle tests.
+  - 100% pass rate with zero skips, zero errors, and zero failures.
 
 ### 1.2. Requirements Not Yet Implemented
 - **CI Quality Gate Pipeline Enhancements:**
