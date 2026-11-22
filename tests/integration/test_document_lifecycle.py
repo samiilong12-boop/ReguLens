@@ -1533,7 +1533,7 @@ async def test_scenario_23_finalize_upload_db_commit_failure_and_retry_recovery(
     )
     assert retry_res.status_code == 200
     assert retry_res.json()["status"] == "AVAILABLE"
-    storage_key = retry_res.json()["storage_key"]
+    storage_key = doc_in_db.storage_key
 
     # 6. Verify post-commit state: DB committed, storage promoted, quarantine purged
     assert doc_in_db.status == "AVAILABLE"
@@ -1574,7 +1574,8 @@ async def test_scenario_24_delete_document_db_commit_failure_preserves_storage(
         headers={"Authorization": f"Bearer {token_a}"},
     )
     assert fin_res.status_code == 200
-    storage_key = fin_res.json()["storage_key"]
+    doc_in_db = ctx["db_store"]["documents"][uuid.UUID(doc_id)]
+    storage_key = doc_in_db.storage_key
     assert storage.object_exists(storage_key) is True
 
     # 2. Simulate DB commit failure on delete
