@@ -245,6 +245,88 @@ def test_storage_service_streaming_upload_bounded_and_cleanup(tmp_path):
     assert not local.object_exists(loc_empty_key)
 
 
+def test_s3_and_gcs_spooling_cleanup_on_success_overflow_and_failure():
+    """Verify S3 and GCS disk spooling unlinks temporary files on success, overflow, and provider failure."""
+    temp_dir = Path(tempfile.gettempdir())
+
+    def run_sync(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    # --- S3 Spooling Cleanup ---
+    mock_boto = MagicMock()
+    mock_s3_client = MagicMock()
+    mock_boto.client.return_value = mock_s3_client
+
+    with patch.dict("sys.modules", {"boto3": mock_boto, "botocore.config": MagicMock()}):
+        s3 = S3StorageService(bucket_name="spool-bucket")
+
+        # 1. Success case: temp spool unlinked
+        before_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        total = run_sync(s3.stream_upload_object("tenants/t1/doc1", iter([b"data1", b"data2"]), max_bytes=100))
+        assert total == 10
+        assert mock_s3_client.put_object.called is True
+        after_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+        # 2. Overflow case: StoragePayloadTooLargeError raised and temp spool unlinked
+        before_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        with pytest.raises(StoragePayloadTooLargeError):
+            run_sync(s3.stream_upload_object("tenants/t1/overflow", iter([b"A" * 60, b"B" * 60]), max_bytes=100))
+        after_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+        # 3. Provider error case: put_object fails, error propagated and temp spool unlinked
+        mock_s3_client.put_object.side_effect = RuntimeError("S3 Put Failed")
+        before_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        with pytest.raises(RuntimeError, match="S3 Put Failed"):
+            run_sync(s3.stream_upload_object("tenants/t1/fail", iter([b"some-bytes"]), max_bytes=100))
+        after_spools = set(temp_dir.glob("regulens_s3_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+    # --- GCS Spooling Cleanup ---
+    mock_storage = MagicMock()
+    mock_gcs_client = MagicMock()
+    mock_bucket = MagicMock()
+    mock_blob = MagicMock()
+    mock_storage.Client.return_value = mock_gcs_client
+    mock_gcs_client.bucket.return_value = mock_bucket
+    mock_bucket.blob.return_value = mock_blob
+
+    mock_google = MagicMock()
+    mock_google.storage = mock_storage
+
+    with patch.dict("sys.modules", {"google": MagicMock(cloud=mock_google), "google.cloud": mock_google, "google.cloud.storage": mock_storage}):
+        gcs = GCSStorageService(bucket_name="gcs-spool-bucket")
+
+        # 1. Success case: temp spool unlinked
+        before_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        total = run_sync(gcs.stream_upload_object("tenants/t1/gcs_doc", iter([b"gcs1", b"gcs2"]), max_bytes=100))
+        assert total == 8
+        assert mock_blob.upload_from_filename.called is True
+        after_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+        # 2. Overflow case: temp spool unlinked
+        before_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        with pytest.raises(StoragePayloadTooLargeError):
+            run_sync(gcs.stream_upload_object("tenants/t1/gcs_overflow", iter([b"Z" * 80, b"Z" * 50]), max_bytes=100))
+        after_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+        # 3. Provider error case: upload_from_filename fails, temp spool unlinked
+        mock_blob.upload_from_filename.side_effect = RuntimeError("GCS Upload Failed")
+        mock_blob.exists.return_value = False
+        before_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        with pytest.raises(RuntimeError, match="GCS Upload Failed"):
+            run_sync(gcs.stream_upload_object("tenants/t1/gcs_fail", iter([b"payload"]), max_bytes=100))
+        after_spools = set(temp_dir.glob("regulens_gcs_spool_*.tmp"))
+        assert after_spools - before_spools == set()
+
+
+
 def test_s3_storage_verify_bucket_configuration():
     """S3 bucket verification must fail closed if public access block settings are missing or incomplete."""
     mock_boto = MagicMock()

@@ -173,8 +173,8 @@ jobs:
           print(f'Total Skipped        : {total_skipped}')
           print(f'RLS Skipped          : {rls_skipped}')
 
-          min_total_tests = 150
-          min_rls_tests = 55
+          min_total_tests = 160
+          min_rls_tests = 57
 
           if total_tests < min_total_tests:
               print(f'CI Quality Gate Violation: Executed total tests ({total_tests}) below required minimum ({min_total_tests})!', file=sys.stderr)
@@ -198,3 +198,35 @@ jobs:
 
           print(f'Quality Gate Passed: All {total_tests} tests executed ({rls_tests_found} RLS tests), 0 skipped, 0 failures.')
           "
+
+  frontend-quality:
+    name: Frontend Lint, Type-Check & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: TypeScript type-check
+        working-directory: apps/web
+        run: npm run type-check
+
+      - name: ESLint check
+        working-directory: apps/web
+        run: npm run lint
+
+      - name: Next.js production build
+        working-directory: apps/web
+        run: npm run build
+

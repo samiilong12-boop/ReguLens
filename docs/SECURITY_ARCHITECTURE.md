@@ -134,7 +134,20 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
      - **Magic-Byte Signature Verification:** Server inspects the binary header bytes (`file_validation.py`) to confirm actual content matches declared MIME type (e.g. `%PDF-` for PDF, `\x89PNG\r\n\x1a\n` for PNG, `\xff\xd8\xff` for JPEG, `II*\x00` or `MM\x00*` for TIFF). Mismatched magic bytes immediately reject the file (HTTP 400) and purge quarantine storage.
      - **SHA-256 Checksum Verification:** Server computes the SHA-256 hash of the payload and verifies it against client-provided hash (HTTP 400 on mismatch).
      - **Malware Scanning:** Payload is passed to the malware scanner subsystem.
-     - **Atomic Promotion:** Upon passing all checks, the object is copied/moved to permanent storage at `tenants/{tenant_id}/documents/{uuid}`, the quarantine object is deleted, `quarantine_key` is cleared (`None`), document status is updated to `AVAILABLE`, and `validated_at` timestamp is set.
+     - **Copy-Commit-Purge Promotion (Consistency & Retry Safety):** Promotion from quarantine to permanent storage follows a robust 3-step sequence:
+       1. *Copy:* Object is copied to permanent storage at `tenants/{tenant_id}/documents/{uuid}`. If a prior attempt already copied the object, existing destination is safely detected.
+       2. *Commit:* Document record is updated in PostgreSQL within a transaction (`status = "AVAILABLE"`, `storage_key = final_key`, `quarantine_key = None`, `validated_at`), along with immutable audit logs. If the database commit fails, the transaction is rolled back, the quarantine file is preserved intact in storage, and HTTP 500 is returned with retry guidance; no unrecoverable or inconsistent state is created.
+       3. *Purge:* Once the database commit succeeds, the quarantine object is purged post-commit best-effort. If deletion fails, the retention cleaner prunes the abandoned quarantine object without impacting document availability.
+
+- **Storage / Database Consistency Model:**
+  - Distributed atomicity between PostgreSQL and object storage is not claimed. Consistency is maintained deterministically through:
+    - *Finalization (Copy-Commit-Purge):* Object copy -> Database commit -> Post-commit quarantine purge. Retry-safe on transient database commit or network failures.
+    - *Deletion (Commit-Purge):* Database delete + audit log -> Database commit -> Post-commit storage object purge. If the database transaction fails, storage objects remain intact. If post-commit storage deletion encounters an error, a structured reconciliation warning is logged.
+
+- **Bounded Disk-Spooling for Cloud Storage Streaming:**
+  - For server-mediated uploads (`S3StorageService.stream_upload_object` and `GCSStorageService.stream_upload_object`), incoming request streams are spooled to temporary files under `0600` permissions via `tempfile.mkstemp` and `os.chmod`.
+  - Byte limits (25MB hard ceiling) are enforced chunk-by-chunk during spooling. Exceeding limits immediately aborts the stream with `StoragePayloadTooLargeError` without buffering entire payloads in RAM.
+  - Spool files are unlinked in all execution branches within `finally:` blocks, verified by tests on success, payload overflow, and provider upload failure.
 
 - **Quarantine Retention & Cleanup (`apps/api/app/services/cleanup.py`):**
   - Abandoned quarantine objects older than 24 hours are safely pruned via `purge_abandoned_quarantine_objects()`.
@@ -156,11 +169,11 @@ Exporters upload sensitive commercial invoices, lab reports, and customs documen
 
 - **Authorized Document Deletion (`DELETE /api/v1/documents/{id}`):**
   - Restricted to authenticated users with `OWNER` or `ADMIN` roles in the tenant.
-  - The permanent storage object is purged from the storage backend.
-  - The document record is removed from the database, and an immutable audit log is generated.
+  - Follows Commit-Purge: the database record is removed and immutable audit log committed first within the transaction; permanent and quarantine storage objects are purged post-commit.
+  - If database commit fails, the transaction is rolled back and storage objects remain intact.
 
 - **PostgreSQL 16 RLS Security & Immutability:**
-  - Real PostgreSQL 16 RLS integration tests (`tests/security/test_postgres_rls.py`, 52 tests) execute as unprivileged runtime role `regulens_app` (`NOBYPASSRLS`).
+  - Real PostgreSQL 16 RLS integration tests (`tests/security/test_postgres_rls.py`, 57 tests) execute as unprivileged runtime role `regulens_app` (`NOBYPASSRLS`).
   - Proves Tenant A cannot read, list, finalize, tamper, download, or delete Tenant B's documents.
   - Audit logs are tenant-isolated and strictly append-only; unprivileged attempts to UPDATE or DELETE raise SQLSTATE 42501 (insufficient privilege).
 

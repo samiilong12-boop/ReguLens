@@ -639,13 +639,27 @@ class S3StorageService(StorageService):
         max_bytes: int,
         content_type: Optional[str] = None,
     ) -> int:
+        """Uploads an incoming byte stream to S3 using bounded disk spooling.
+        
+        Architecture Note:
+        Incoming stream chunks are spooled to a restricted temporary file (mode 0600)
+        with per-chunk byte limit enforcement to guarantee memory bounds. Once the stream
+        completes within the permitted ceiling (<= 25MB), it is uploaded to S3 via put_object.
+        The temporary spool file is unlinked in all cases within the finally block.
+        """
         import tempfile
         client = self._get_client()
         total_bytes = 0
         limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
 
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        temp_path = Path(temp_file.name)
+        fd, raw_temp_path = tempfile.mkstemp(prefix="regulens_s3_spool_", suffix=".tmp")
+        try:
+            os.chmod(raw_temp_path, 0o600)
+        except OSError:
+            pass
+        os.close(fd)
+
+        temp_path = Path(raw_temp_path)
         try:
             with open(temp_path, "wb") as f:
                 if hasattr(stream, "__aiter__"):
@@ -674,18 +688,20 @@ class S3StorageService(StorageService):
                     params["ContentType"] = content_type
                 client.put_object(**params)
             return total_bytes
-        except Exception:
+        except Exception as e:
+            logger.error("s3_stream_upload_failed", object_key=object_key, error=str(e))
             try:
                 self.delete_object(object_key)
-            except Exception:
-                pass
+            except Exception as del_err:
+                logger.warning("s3_cleanup_partial_object_failed", object_key=object_key, error=str(del_err))
             raise
         finally:
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except OSError:
-                    pass
+                    logger.debug("s3_temporary_upload_spool_cleaned", path=str(temp_path))
+                except OSError as unlink_err:
+                    logger.warning("s3_temporary_upload_spool_cleanup_failed", path=str(temp_path), error=str(unlink_err))
 
     def delete_object(self, object_key: str) -> bool:
         client = self._get_client()
@@ -860,6 +876,14 @@ class GCSStorageService(StorageService):
         max_bytes: int,
         content_type: Optional[str] = None,
     ) -> int:
+        """Uploads an incoming byte stream to GCS using bounded disk spooling.
+        
+        Architecture Note:
+        Incoming stream chunks are spooled to a restricted temporary file (mode 0600)
+        with per-chunk byte limit enforcement to guarantee memory bounds. Once the stream
+        completes within the permitted ceiling (<= 25MB), it is uploaded to GCS via upload_from_filename.
+        The temporary spool file is unlinked in all cases within the finally block.
+        """
         import tempfile
         client = self._get_client()
         bucket = client.bucket(self.bucket_name)
@@ -867,8 +891,14 @@ class GCSStorageService(StorageService):
         total_bytes = 0
         limit = max_bytes or getattr(settings, "MAX_DOCUMENT_SIZE_BYTES", 25 * 1024 * 1024)
 
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        temp_path = Path(temp_file.name)
+        fd, raw_temp_path = tempfile.mkstemp(prefix="regulens_gcs_spool_", suffix=".tmp")
+        try:
+            os.chmod(raw_temp_path, 0o600)
+        except OSError:
+            pass
+        os.close(fd)
+
+        temp_path = Path(raw_temp_path)
         try:
             with open(temp_path, "wb") as f:
                 if hasattr(stream, "__aiter__"):
@@ -893,19 +923,21 @@ class GCSStorageService(StorageService):
 
             blob.upload_from_filename(str(temp_path), content_type=content_type)
             return total_bytes
-        except Exception:
+        except Exception as e:
+            logger.error("gcs_stream_upload_failed", object_key=object_key, error=str(e))
             try:
                 if blob.exists():
                     blob.delete()
-            except Exception:
-                pass
+            except Exception as del_err:
+                logger.warning("gcs_cleanup_partial_object_failed", object_key=object_key, error=str(del_err))
             raise
         finally:
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except OSError:
-                    pass
+                    logger.debug("gcs_temporary_upload_spool_cleaned", path=str(temp_path))
+                except OSError as unlink_err:
+                    logger.warning("gcs_temporary_upload_spool_cleanup_failed", path=str(temp_path), error=str(unlink_err))
 
     def delete_object(self, object_key: str) -> bool:
         client = self._get_client()

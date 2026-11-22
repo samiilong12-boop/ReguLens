@@ -26,34 +26,37 @@ In accordance with `.agents/rules/TEAM_WORKFLOW.md`, the phase scope is explicit
   - User-scoped RLS policies on `tenants` and `tenant_users` via Alembic migration `0003_membership_rls_policies`.
   - Bidirectional migration downgrade/upgrade cycle verification (`0003` -> `0002` -> `0003`).
   - Implemented in `apps/api/app/api/v1/endpoints/auth.py` and `apps/api/app/api/deps.py`; preserved in Draft PR #2.
-- **Package C (Private File Storage Pipeline, Security Remediation & Upload Controls):**
+- **Package C (Private File Storage Pipeline, Security Remediation & Consistency):**
   - Pluggable storage abstraction (`StorageService` with `MemoryStorageService`, `LocalStorageService`, `S3StorageService`, and `GCSStorageService` per ADR 0008) isolating files by tenant under `tenants/{tenant_id}/quarantine/` and `tenants/{tenant_id}/documents/`.
   - Production fail-closed validation: startup checks reject in-memory/local storage and mock scanners in staging/production, requiring persistent private storage (`s3` or `gcs`) and real scanner (`clamav`).
   - Transport and private bucket controls: SSL strictly required in staging/production (`S3_USE_SSL=True`); insecure `http://` rejected; startup verification validates AWS PublicAccessBlock (all 4 flags True) or GCS Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
   - Upload-time size enforcement: hard 25MB limit (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`) enforced via S3 presigned POST `content-length-range` condition and exact object-key match condition `{"key": object_key}`. Failures during presigned POST policy generation fail closed (`StorageSecurityError`), never falling back to unrestricted presigned PUT; for GCS where signed PUT URLs cannot enforce content-length at provider boundary, `supports_direct_upload = False` and `initiate-upload` directs to authenticated server-mediated bounded streaming upload endpoint `POST /api/v1/documents/{id}/upload-content` with upload-time byte enforcement.
-  - Bounded storage-level streaming write: `POST /api/v1/documents/{id}/upload-content` streams chunks directly to storage quarantine via `StorageService.stream_upload_object()`, enforcing byte limits per chunk with backpressure, aborting immediately upon exceeding 25MB, and purging partial quarantine objects on error without accumulating chunk lists in memory.
+  - Bounded storage-level streaming & disk spooling: `POST /api/v1/documents/{id}/upload-content` spools incoming chunks to restricted temporary files with `0600` permissions (`mkstemp`/`os.chmod`), enforcing 25MB limits chunk-by-chunk with backpressure, and guaranteeing unlinking in all branches via `finally:` blocks on success, overflow, and provider failure.
+  - Storage/Database Consistency Models:
+    - *Finalization (Copy-Commit-Purge):* Object is copied to destination key; document attributes (`AVAILABLE`, storage_key, quarantine_key=None) and audit records are committed within the database transaction; quarantine file is purged post-commit best-effort. If commit fails, rollback preserves quarantine object for client retry without state corruption.
+    - *Deletion (Commit-Purge):* Document row and audit log are deleted and committed within transaction first; storage objects are purged post-commit.
   - Pre-read memory exhaustion protection: finalization queries `get_object_metadata` *before* reading into memory; oversized objects are immediately purged from quarantine without buffering into RAM.
   - Server-side file validation (`file_validation.py`): magic-byte file signature validation (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`) and SHA-256 payload integrity hash verification.
-  - Malware scanning subsystem (`scanner.py`): `BaseMalwareScanner`, `ClamAVScanner` connecting via streaming TCP protocol, and `MockMalwareScanner` detecting standard EICAR test string.
+  - Malware scanning subsystem (`scanner.py`): `BaseMalwareScanner`, `ClamAVScanner` connecting via streaming TCP protocol (with `timeout_seconds` factory initialization and global state reset helper `reset_malware_scanner()`), and `MockMalwareScanner` detecting standard EICAR test string.
   - Fail-safe invariant: scanner errors/timeouts raise `ScannerUnavailableError` (HTTP 503 Service Unavailable), never silently marking unscanned files as clean. Malware detection rejects upload (HTTP 422), purges file from quarantine storage, and sets status to `QUARANTINED`.
   - Secure authenticated download (`GET /api/v1/documents/{id}/download-url`): generates 15-minute presigned download URLs strictly for documents with `status == "AVAILABLE"` and `quarantine_key is None`. Rejects unvalidated or infected files with HTTP 403 Forbidden.
-  - Authorized document deletion (`DELETE /api/v1/documents/{id}`): Owner/Admin only; purges object from storage backend and deletes database row.
+  - Authorized document deletion (`DELETE /api/v1/documents/{id}`): Owner/Admin only; follows Commit-Purge sequence.
   - Quarantine retention & cleanup (`cleanup.py`): tenant-scoped automated and CLI pruning (`purge_abandoned_quarantine_objects()`) for abandoned quarantine uploads older than 24 hours under PostgreSQL RLS and live `OWNER`/`ADMIN` role verification, preserving active uploads (< 24 hours).
-  - Sanitized audit logging (`audit.py`): logs document upload, download URL generation, failure, deletion, and cleanup events while automatically redacting presigned URLs, query tokens, and authorization headers.
+  - Sanitized audit logging (`audit.py`): logs document upload, download URL generation, failure, deletion, and cleanup events while automatically redacting presigned URLs, query tokens, and authorization headers; client error responses sanitized against infrastructure/provider exception leaks.
   - Alembic migration `0004_document_storage_fields.py` adding storage fields, nullable `consignment_id`, `idx_documents_status`, with safe downgrade guard preventing data loss on records with NULL `consignment_id` or `sha256_hash`.
-  - Migration cycle teardown verification: `tests/security/test_postgres_rls.py` eliminates silent exception swallowing, tracking all teardown errors and asserting record deletion, Alembic version restoration to `0004_document_storage_fields`, and schema column integrity with explicit `pytest.fail()` diagnostics.
+  - Migration cycle teardown verification: `tests/security/test_postgres_rls.py` eliminates silent exception swallowing, using `sys.exc_info()` to avoid masking in-flight test exceptions while asserting schema integrity and teardown cleanup.
   - Dedicated PostgreSQL 16 RLS security tests (57 tests total) executing as unprivileged `regulens_app` role (`NOBYPASSRLS`), proving cross-tenant document isolation, append-only audit log protection, and tenant-scoped quarantine cleanup isolation.
   - Implemented in `apps/api/app/services/`, `apps/api/app/api/v1/endpoints/documents.py`, `apps/api/alembic/versions/0004_document_storage_fields.py`; preserved in Draft PR #3.
-- **Automated Test Execution:**
-  - 155 total tests passing in GitHub Actions CI (run 44782179656): 76 unit tests, 22 integration tests, 57 PostgreSQL 16 RLS security and migration cycle tests.
-  - 100% pass rate with zero skips, zero errors, and zero failures.
+- **Automated Test Execution & CI Verification:**
+  - 160 total tests in automated suite: 79 unit tests, 24 integration tests (including DB commit failure retry recovery and delete preservation), 57 PostgreSQL 16 RLS security and migration cycle tests.
+  - 100% pass rate with zero skips, zero errors, and zero failures enforced in CI gate (`.github/workflows/phase1-ci.yml`).
+  - Frontend Quality Gate added to CI: Next.js 15 / React 19 linting, TypeScript type-checking, and production build.
 
 ### 1.2. Requirements Not Yet Implemented
 - **CI Quality Gate Pipeline Enhancements:**
-  - Ruff linting and formatting step.
-  - MyPy static type-checking step.
-  - Frontend lint, type-check, and build steps.
-  - Automated dependency vulnerability scanning step.
+  - Ruff Python linting and formatting step (requires founder decision on repository-wide style and line length configuration).
+  - MyPy static type-checking step (requires founder decision on typing strictness and third-party stubs).
+  - Automated dependency vulnerability scanning step (e.g. `pip-audit`, `npm audit`).
 
 ### 1.3. Requirements Not Yet Independently Verified
 - **Independent External Review:** Reviews conducted to date are automated CI pipeline checks and agent self-reviews. No independent external third-party human security audit has taken place (`QUALITY_GATES.md` Section 1).
@@ -79,14 +82,14 @@ Direct inspection of `.github/workflows/phase1-ci.yml` establishes the following
 
 | Check Category | Current CI Status | CI Workflow Evidence (`.github/workflows/phase1-ci.yml`) |
 |---|---|---|
-| **Backend Pytest Suite** | **PRESENT & ENFORCED** | Job `test-phase1-rls`, Step `Execute complete test suite` running `uv run pytest -c pyproject.toml -v -rs --junit-xml=test-results.xml` (lines 103–111). |
-| **PostgreSQL 16 Service & RLS Tests** | **PRESENT & ENFORCED** | Service container `postgres:16-alpine` (lines 22–34), provisioning via `scripts/init_db_roles.sql` (lines 49–53), XML gate asserting ≥44 RLS tests and 0 skips (lines 113–200). |
-| **Ruff (Python Linting)** | **NOT CURRENTLY RUN** | Zero occurrences in `.github/workflows/phase1-ci.yml`. No linting step configured. |
-| **MyPy (Static Type-Checking)** | **NOT CURRENTLY RUN** | Zero occurrences in `.github/workflows/phase1-ci.yml`. No type-checking step configured. |
-| **Frontend Lint** | **NOT CURRENTLY RUN** | Zero frontend jobs or steps configured in CI workflow. |
-| **Frontend Type-Check** | **NOT CURRENTLY RUN** | Zero frontend TypeScript checking steps configured in CI workflow. |
-| **Frontend Build** | **NOT CURRENTLY RUN** | Zero frontend build steps configured in CI workflow. |
-| **Dependency Vulnerability Scanning** | **NOT CURRENTLY CONFIGURED** | Zero vulnerability scanning tools (such as `pip-audit`, `npm audit`, `trivy`, or `dependabot`) configured in workflow. |
+| **Backend Pytest Suite** | **PRESENT & ENFORCED** | Job `test-phase1-rls`, Step `Execute complete test suite` running `uv run pytest -c pyproject.toml -v -rs --junit-xml=test-results.xml` (≥160 tests, 0 skipped, 0 failed). |
+| **PostgreSQL 16 Service & RLS Tests** | **PRESENT & ENFORCED** | Service container `postgres:16-alpine`, provisioning via `scripts/init_db_roles.sql`, XML gate asserting ≥57 RLS tests and 0 skips. |
+| **Frontend Lint** | **PRESENT & ENFORCED** | Job `frontend-quality`, Step `ESLint check` running `npm run lint`. |
+| **Frontend Type-Check** | **PRESENT & ENFORCED** | Job `frontend-quality`, Step `TypeScript type-check` running `npm run type-check`. |
+| **Frontend Build** | **PRESENT & ENFORCED** | Job `frontend-quality`, Step `Next.js production build` running `npm run build`. |
+| **Ruff (Python Linting)** | **NOT CURRENTLY RUN** | Zero occurrences in `.github/workflows/phase1-ci.yml`. Requires founder decision on repository-wide style and line length ruleset before enforcement. |
+| **MyPy (Static Type-Checking)** | **NOT CURRENTLY RUN** | Zero occurrences in `.github/workflows/phase1-ci.yml`. Requires founder decision on typing strictness and stubs before enforcement. |
+| **Dependency Vulnerability Scanning** | **NOT CURRENTLY CONFIGURED** | Zero vulnerability scanning tools (such as `pip-audit`, `npm audit`, `trivy`, or `dependabot`) configured in workflow (`Requires founder action`). |
 
 *Note: In accordance with task constraints, these missing CI checks are accurately documented as unresolved quality gate gaps and are NOT implemented in this documentation task.*
 

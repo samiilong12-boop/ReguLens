@@ -69,6 +69,18 @@ class MockAsyncSession:
     def __init__(self, db_store: dict):
         self.db_store = db_store
         self.sync_session = type("SyncSession", (), {"info": {}})()
+        self._pending_deletions = set()
+        self._initial_doc_ids = set(self.db_store.get("documents", {}).keys())
+        self._snapshots = {}
+        for doc_id, doc in self.db_store.get("documents", {}).items():
+            self._snapshots[doc_id] = {
+                "status": doc.status,
+                "quarantine_key": doc.quarantine_key,
+                "storage_key": doc.storage_key,
+                "sha256_hash": getattr(doc, "sha256_hash", None),
+                "file_size_bytes": getattr(doc, "file_size_bytes", None),
+                "mime_type": getattr(doc, "mime_type", None),
+            }
 
     def add(self, obj: Any) -> None:
         if getattr(obj, "id", None) is None:
@@ -76,6 +88,15 @@ class MockAsyncSession:
         if getattr(obj, "created_at", None) is None:
             obj.created_at = datetime.now(timezone.utc)
         if isinstance(obj, Document):
+            if obj.id not in self._snapshots and obj.id in self._initial_doc_ids:
+                self._snapshots[obj.id] = {
+                    "status": obj.status,
+                    "quarantine_key": obj.quarantine_key,
+                    "storage_key": obj.storage_key,
+                    "sha256_hash": getattr(obj, "sha256_hash", None),
+                    "file_size_bytes": getattr(obj, "file_size_bytes", None),
+                    "mime_type": getattr(obj, "mime_type", None),
+                }
             self.db_store["documents"][obj.id] = obj
         elif isinstance(obj, Consignment):
             self.db_store["consignments"][obj.id] = obj
@@ -84,16 +105,41 @@ class MockAsyncSession:
 
     async def delete(self, obj: Any) -> None:
         if isinstance(obj, Document):
-            self.db_store["documents"].pop(obj.id, None)
+            self._pending_deletions.add(obj.id)
 
     async def commit(self) -> None:
-        pass
+        if self.db_store.get("_fail_commit"):
+            raise RuntimeError("Simulated database commit failure")
+        for doc_id in self._pending_deletions:
+            self.db_store["documents"].pop(doc_id, None)
+            self._snapshots.pop(doc_id, None)
+        self._pending_deletions.clear()
+        # Update snapshots to committed state
+        for doc_id, doc in self.db_store.get("documents", {}).items():
+            self._snapshots[doc_id] = {
+                "status": doc.status,
+                "quarantine_key": doc.quarantine_key,
+                "storage_key": doc.storage_key,
+                "sha256_hash": getattr(doc, "sha256_hash", None),
+                "file_size_bytes": getattr(doc, "file_size_bytes", None),
+                "mime_type": getattr(doc, "mime_type", None),
+            }
 
     async def flush(self) -> None:
         pass
 
     async def rollback(self) -> None:
-        pass
+        self._pending_deletions.clear()
+        # Restore snapshots or remove uncommitted new documents
+        current_ids = list(self.db_store.get("documents", {}).keys())
+        for doc_id in current_ids:
+            if doc_id not in self._initial_doc_ids:
+                self.db_store["documents"].pop(doc_id, None)
+            elif doc_id in self._snapshots:
+                doc = self.db_store["documents"].get(doc_id)
+                if doc:
+                    for k, v in self._snapshots[doc_id].items():
+                        setattr(doc, k, v)
 
     async def refresh(self, obj: Any) -> None:
         if getattr(obj, "updated_at", None) is None:
@@ -120,6 +166,8 @@ class MockAsyncSession:
             status_filter = params.get("status_1") or params.get("status")
             count = 0
             for doc in self.db_store["documents"].values():
+                if doc.id in self._pending_deletions:
+                    continue
                 if str(doc.tenant_id) == str(tenant_id):
                     if status_filter and doc.status != status_filter:
                         continue
@@ -135,6 +183,8 @@ class MockAsyncSession:
             if doc_id is not None:
                 # Single document query
                 for doc in self.db_store["documents"].values():
+                    if doc.id in self._pending_deletions:
+                        continue
                     if str(doc.id) == str(doc_id) and str(doc.tenant_id) == str(tenant_id):
                         return MockResult(item=doc)
                 return MockResult(item=None)
@@ -1379,9 +1429,11 @@ async def test_scenario_22_s3_presigned_post_failure_fails_closed_and_bounded_st
                 },
                 headers={"Authorization": f"Bearer {token_a}"},
             )
-            # Must return 500 error, never a 201 with an unrestricted presigned PUT
+            # Must return 500 error, sanitized message without leaking AWS/internal infrastructure
             assert init_res.status_code == 500
-            assert "Failed to generate secure S3 presigned POST policy" in init_res.json()["detail"]
+            assert "Secure upload policy generation failed" in init_res.json()["detail"]
+            assert "AWS Connection Failure" not in init_res.json()["detail"]
+            assert "test-s3-bucket" not in init_res.json()["detail"]
             assert mock_s3_client.generate_presigned_url.called is False
         finally:
             set_storage_service(ctx["storage"])
@@ -1424,3 +1476,132 @@ async def test_scenario_22_s3_presigned_post_failure_fails_closed_and_bounded_st
     # Invariant: Partial object is purged from storage quarantine
     storage = ctx["storage"]
     assert not storage.object_exists(q_key2)
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_23_finalize_upload_db_commit_failure_and_retry_recovery(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 23: Database commit failure during document finalization leaves quarantine intact, rolls back DB, and allows retry recovery."""
+    client = document_test_client
+    ctx = document_test_context
+    storage = ctx["storage"]
+    token_a = ctx["tokens"]["compliance_a"]
+
+    # 1. Initiate upload
+    init_res = await client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "retry_test.pdf",
+            "expected_size_bytes": len(VALID_PDF_BYTES),
+            "claimed_mime_type": "application/pdf",
+            "document_type": "CERTIFICATE_OF_ORIGIN",
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res.status_code == 201
+    doc_id = init_res.json()["document_id"]
+    q_key = init_res.json()["quarantine_key"]
+    storage_key = init_res.json()["storage_key"]
+
+    # 2. Put file in quarantine
+    storage.put_object(q_key, VALID_PDF_BYTES, "application/pdf")
+    assert storage.object_exists(q_key)
+
+    # 3. Simulate DB commit failure
+    ctx["db_store"]["_fail_commit"] = True
+
+    fin_res = await client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert fin_res.status_code == 500
+    assert "Database transaction commit failed during document finalization" in fin_res.json()["detail"]
+
+    # 4. Verify DB state rolled back and quarantine file was preserved
+    doc_in_db = ctx["db_store"]["documents"][uuid.UUID(doc_id)]
+    assert doc_in_db.status == "PENDING_UPLOAD"
+    assert doc_in_db.quarantine_key == q_key
+    assert storage.object_exists(q_key) is True
+
+    # 5. Clear transient failure and retry finalization
+    ctx["db_store"]["_fail_commit"] = False
+
+    retry_res = await client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert retry_res.status_code == 200
+    assert retry_res.json()["status"] == "AVAILABLE"
+
+    # 6. Verify post-commit state: DB committed, storage promoted, quarantine purged
+    assert doc_in_db.status == "AVAILABLE"
+    assert doc_in_db.quarantine_key is None
+    assert storage.object_exists(storage_key) is True
+    assert storage.object_exists(q_key) is False
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_24_delete_document_db_commit_failure_preserves_storage(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 24: Database commit failure during document deletion rolls back DB delete and preserves storage objects."""
+    client = document_test_client
+    ctx = document_test_context
+    storage = ctx["storage"]
+    token_a = ctx["tokens"]["owner_a"]
+
+    # 1. Create and finalize a valid document
+    init_res = await client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "delete_safety.pdf",
+            "expected_size_bytes": len(VALID_PDF_BYTES),
+            "claimed_mime_type": "application/pdf",
+            "document_type": "COMMERCIAL_INVOICE",
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res.status_code == 201
+    doc_id = init_res.json()["document_id"]
+    q_key = init_res.json()["quarantine_key"]
+    storage_key = init_res.json()["storage_key"]
+
+    storage.put_object(q_key, VALID_PDF_BYTES, "application/pdf")
+    fin_res = await client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert fin_res.status_code == 200
+    assert storage.object_exists(storage_key) is True
+
+    # 2. Simulate DB commit failure on delete
+    ctx["db_store"]["_fail_commit"] = True
+
+    del_res = await client.delete(
+        f"/api/v1/documents/{doc_id}",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert del_res.status_code == 500
+    assert "Database transaction commit failed during document deletion" in del_res.json()["detail"]
+
+    # 3. Verify document row and storage object were NOT deleted
+    assert uuid.UUID(doc_id) in ctx["db_store"]["documents"]
+    assert storage.object_exists(storage_key) is True
+
+    # 4. Clear failure and retry deletion
+    ctx["db_store"]["_fail_commit"] = False
+
+    del_retry = await client.delete(
+        f"/api/v1/documents/{doc_id}",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert del_retry.status_code == 200
+    assert del_retry.json()["status"] == "deleted"
+
+    # 5. Invariant: Row deleted from DB and storage object purged post-commit
+    assert uuid.UUID(doc_id) not in ctx["db_store"]["documents"]
+    assert storage.object_exists(storage_key) is False
+

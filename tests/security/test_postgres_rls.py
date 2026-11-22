@@ -22,7 +22,9 @@ In accordance with AGENTS.md Rule 7, QUALITY_GATES.md, and Phase 1 Package A:
 """
 import os
 import socket
+import sys
 import uuid
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Tuple
 
@@ -180,7 +182,8 @@ async def provisioned_tenants(
     try:
         yield (tenant_a, tenant_b, prod_a_id, prod_b_id)
     finally:
-        # 2. Teardown: Clean up in reverse dependency order
+        # 2. Teardown: Clean up in reverse dependency order without masking test failures
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -208,8 +211,12 @@ async def provisioned_tenants(
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_tenants after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_tenants teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -320,6 +327,7 @@ async def provisioned_hierarchy(
     try:
         yield hierarchy
     finally:
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -335,8 +343,12 @@ async def provisioned_hierarchy(
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_hierarchy after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_hierarchy teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 # ==============================================================================
@@ -1084,6 +1096,7 @@ async def provisioned_multi_tenant_users(
     try:
         yield context
     finally:
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -1099,8 +1112,12 @@ async def provisioned_multi_tenant_users(
                 {"u1": str(user_1_id), "u2": str(user_2_id), "u3": str(user_3_id)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_multi_tenant_users after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_multi_tenant_users teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 @pytest.mark.asyncio(loop_scope="function")

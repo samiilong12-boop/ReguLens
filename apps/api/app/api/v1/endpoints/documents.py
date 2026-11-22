@@ -129,7 +129,7 @@ async def initiate_upload(
             logger.error("presigned_upload_generation_failed", error=str(e), key=quarantine_key)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Secure upload policy generation failed: {e}",
+                detail="Secure upload policy generation failed. Please retry or contact support.",
             )
 
     # Log immutable audit event
@@ -243,10 +243,11 @@ async def upload_document_content(
             detail=str(e),
         )
     except Exception as e:
+        logger.error("upload_streaming_failed", document_id=str(document_id), error=str(e))
         storage_service.delete_object(document.quarantine_key)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Upload streaming failed: {e}",
+            detail="Upload streaming failed due to a server error. Please retry.",
         )
 
     document.file_size_bytes = total_bytes
@@ -301,24 +302,30 @@ async def finalize_upload(
             detail=f"Document is not pending upload (current status: '{document.status}').",
         )
 
-    # Verify object exists in storage quarantine
-    if not document.quarantine_key or not storage_service.object_exists(document.quarantine_key):
+    # Verify object exists in storage quarantine or already promoted in permanent storage from a prior attempt
+    has_quarantine = bool(document.quarantine_key and storage_service.object_exists(document.quarantine_key))
+    has_permanent = bool(document.storage_key and storage_service.object_exists(document.storage_key))
+
+    if not has_quarantine and not has_permanent:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Upload payload not found in storage quarantine. Please upload file before finalization.",
+            detail="Upload payload not found in storage. Please upload file before finalization.",
         )
+
+    active_object_key = document.quarantine_key if has_quarantine else document.storage_key
 
     # Pre-read metadata inspection: prevent unbounded memory consumption
     try:
-        metadata = storage_service.get_object_metadata(document.quarantine_key)
+        metadata = storage_service.get_object_metadata(active_object_key)
     except Exception as e:
+        logger.error("quarantine_metadata_inspection_failed", document_id=str(document_id), error=str(e))
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unable to inspect quarantine object metadata: {e}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to inspect quarantine object metadata. Please retry.",
         )
 
     if metadata.size_bytes > settings.MAX_DOCUMENT_SIZE_BYTES:
-        storage_service.delete_object(document.quarantine_key)
+        storage_service.delete_object(active_object_key)
         document.status = "REJECTED"
         document.antivirus_status = "REJECTED_OVERSIZED"
         document.rejection_reason = (
@@ -346,7 +353,7 @@ async def finalize_upload(
         )
 
     if metadata.size_bytes == 0:
-        storage_service.delete_object(document.quarantine_key)
+        storage_service.delete_object(active_object_key)
         document.status = "REJECTED"
         document.antivirus_status = "REJECTED_EMPTY_FILE"
         document.rejection_reason = "File payload is empty (0 bytes)."
@@ -368,7 +375,7 @@ async def finalize_upload(
         )
 
     # Read payload bytes bounded by MAX_DOCUMENT_SIZE_BYTES
-    data = storage_service.get_object(document.quarantine_key, max_bytes=settings.MAX_DOCUMENT_SIZE_BYTES)
+    data = storage_service.get_object(active_object_key, max_bytes=settings.MAX_DOCUMENT_SIZE_BYTES)
 
     # Expected SHA-256 can come from initiation or finalize payload
     expected_sha256 = (payload.expected_sha256 if payload else None) or document.sha256_hash
@@ -471,9 +478,11 @@ async def finalize_upload(
             detail="Malware scanner service is temporarily unavailable. Document remains quarantined.",
         )
 
-    # 3. Clean and validated: move from quarantine to permanent storage
-    storage_service.move_object(document.quarantine_key, document.storage_key)
+    # 3. Clean and validated: promote from quarantine to permanent storage using Copy-Commit-Purge
+    if active_object_key != document.storage_key:
+        storage_service.copy_object(active_object_key, document.storage_key)
 
+    quarantine_key_to_purge = document.quarantine_key
     document.quarantine_key = None
     document.status = "AVAILABLE"
     document.antivirus_status = "CLEAN"
@@ -518,7 +527,33 @@ async def finalize_upload(
         user_agent=ua,
     )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as commit_err:
+        logger.error(
+            "document_finalization_commit_failed",
+            document_id=str(document.id),
+            quarantine_key=quarantine_key_to_purge,
+            error=str(commit_err),
+        )
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database transaction commit failed during document finalization. Operation is retry-safe; please retry.",
+        ) from commit_err
+
+    # Step B: Purge from quarantine post-commit (best-effort; retention cleaner will prune if this fails)
+    if quarantine_key_to_purge and storage_service.object_exists(quarantine_key_to_purge):
+        try:
+            storage_service.delete_object(quarantine_key_to_purge)
+        except Exception as purge_err:
+            logger.warning(
+                "quarantine_cleanup_post_finalize_failed",
+                document_id=str(document.id),
+                quarantine_key=quarantine_key_to_purge,
+                error=str(purge_err),
+            )
+
     await db.refresh(document)
     return DocumentResponse.model_validate(document)
 
@@ -663,19 +698,15 @@ async def delete_document(
             detail="Document not found.",
         )
 
-    # Purge objects from storage
-    if document.storage_key and storage_service.object_exists(document.storage_key):
-        storage_service.delete_object(document.storage_key)
-    if document.quarantine_key and storage_service.object_exists(document.quarantine_key):
-        storage_service.delete_object(document.quarantine_key)
-
     file_name = document.file_name
     sha256_hash = document.sha256_hash
+    storage_key_to_purge = document.storage_key
+    quarantine_key_to_purge = document.quarantine_key
 
-    # Delete row from documents table
+    # 1. Delete row from documents table within transaction
     await db.delete(document)
 
-    # Record append-only audit event
+    # 2. Record append-only audit event within transaction
     await log_document_audit_event(
         db=db,
         tenant_id=current_user.tenant_id,
@@ -686,7 +717,33 @@ async def delete_document(
         ip_address=ip,
         user_agent=ua,
     )
-    await db.commit()
+
+    try:
+        await db.commit()
+    except Exception as commit_err:
+        logger.error(
+            "document_deletion_commit_failed",
+            document_id=str(document_id),
+            error=str(commit_err),
+        )
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database transaction commit failed during document deletion. Document was not deleted.",
+        ) from commit_err
+
+    # 3. Purge storage objects post-commit (if storage fails, orphaned objects are logged for reconciliation)
+    for key in (storage_key_to_purge, quarantine_key_to_purge):
+        if key and storage_service.object_exists(key):
+            try:
+                storage_service.delete_object(key)
+            except Exception as e:
+                logger.error(
+                    "storage_object_purge_failed_post_delete_commit",
+                    key=key,
+                    document_id=str(document_id),
+                    error=str(e),
+                )
 
     return {"status": "deleted", "document_id": str(document_id)}
 

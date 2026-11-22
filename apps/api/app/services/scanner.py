@@ -221,7 +221,7 @@ def get_malware_scanner() -> BaseMalwareScanner:
                 _scanner_instance = ClamAVScanner(
                     host=getattr(settings, "CLAMAV_HOST", "localhost"),
                     port=getattr(settings, "CLAMAV_PORT", 3310),
-                    timeout=getattr(settings, "CLAMAV_TIMEOUT_SECONDS", 5.0),
+                    timeout_seconds=getattr(settings, "CLAMAV_TIMEOUT_SECONDS", 5.0),
                 )
             elif scanner_type == "mock":
                 env = (getattr(settings, "ENVIRONMENT", "") or "").strip().lower()
@@ -237,8 +237,15 @@ def get_malware_scanner() -> BaseMalwareScanner:
     return _scanner_instance
 
 
-def set_malware_scanner(scanner: BaseMalwareScanner) -> None:
-    """Allows tests to inject a configured scanner instance."""
+def set_malware_scanner(scanner: Optional[BaseMalwareScanner]) -> None:
+    """Allows tests to inject a configured scanner instance or reset to None."""
     global _scanner_instance
     with _scanner_lock:
         _scanner_instance = scanner
+
+
+def reset_malware_scanner() -> None:
+    """Resets the global scanner instance so it can be re-initialized from settings."""
+    global _scanner_instance
+    with _scanner_lock:
+        _scanner_instance = None
