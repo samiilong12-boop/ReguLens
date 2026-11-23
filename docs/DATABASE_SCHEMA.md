@@ -424,6 +424,31 @@ CREATE TABLE audit_logs (
 CREATE INDEX idx_audit_tenant_created ON audit_logs(tenant_id, created_at DESC);
 ```
 
+### 3.12. `storage_cleanup_tasks` (Durable Storage Cleanup Outbox)
+```sql
+CREATE TABLE storage_cleanup_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    storage_backend VARCHAR(32) NOT NULL, -- 's3', 'gcs', 'local', 'memory'
+    object_key VARCHAR(1024) NOT NULL,
+    cleanup_reason VARCHAR(64) NOT NULL, -- 'QUARANTINE_POST_FINALIZE', 'DOCUMENT_DELETION'
+    status VARCHAR(32) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'
+    attempts INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_at TIMESTAMPTZ,
+    locked_by VARCHAR(255),
+    last_error TEXT,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_storage_cleanup_tasks_tenant_id UNIQUE (tenant_id, id)
+);
+
+CREATE INDEX idx_storage_cleanup_due ON storage_cleanup_tasks(status, next_retry_at);
+CREATE INDEX idx_storage_cleanup_tenant ON storage_cleanup_tasks(tenant_id, status);
+```
+
 ---
 
 ## 4. PostgreSQL Row Level Security (RLS) Configuration
@@ -527,6 +552,14 @@ CREATE POLICY rls_audit_logs_select ON audit_logs
 CREATE POLICY rls_audit_logs_insert ON audit_logs
     FOR INSERT
     WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+-- 13. storage_cleanup_tasks table
+ALTER TABLE storage_cleanup_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE storage_cleanup_tasks FORCE ROW LEVEL SECURITY;
+CREATE POLICY storage_cleanup_tasks_tenant_isolation_policy ON storage_cleanup_tasks
+    FOR ALL
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 ```
 
 ---

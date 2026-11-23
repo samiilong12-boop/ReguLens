@@ -1,7 +1,8 @@
 # ReguLens — Test Strategy & Quality Verification Plan
 
 ## Document Status
-- **Current Phase:** Phase 0B — Technical Architecture & MVP Definition
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Packages A, B, and C implemented in Draft PRs #1, #2, #3; Gate 1 unclosed pending external security review and founder sign-off)
+- **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Preserving broader multi-sector expansion (citrus + strawberries, apparel) for Phase 3 and beyond.
 - **Scope:** Complete Test Pyramid, Security Gates, Golden Dataset, and Expert Review Protocols
 - **Governance Reference:** `.agents/rules/QUALITY_GATES.md` (Sections 4, 6, 7) and `AGENTS.md`
 
@@ -47,28 +48,33 @@ graph TD
 
 ---
 
-## 2. Quantitative Acceptance Metrics (PROPOSED)
+## 2. Quantitative Acceptance Targets (APPROVED BY FOUNDER)
 
 Per `.agents/rules/QUALITY_GATES.md` (Section 4):
-> "Define these metrics in docs/TEST_STRATEGY.md, measured on an expert-verified golden dataset... The agent proposes threshold values and the golden-dataset size with rationale, marked PROPOSED. Values become binding only after the founder approves them in writing. The agent never finalizes them itself."
+> "Define these metrics in docs/TEST_STRATEGY.md, measured on an expert-verified golden dataset... Values become binding only after the founder approves them in writing. The agent never finalizes them itself."
 
-The following metrics are hereby submitted for founder written approval:
+The founder has explicitly approved the following quantitative acceptance targets.
 
-| Metric | Proposed Target Threshold | Measurement Methodology | Architectural & Business Rationale | Approval Status |
+> [!IMPORTANT]
+> **Approved Targets, NOT Achieved Results:**
+> The thresholds below represent **founder-approved binding acceptance targets**, NOT achieved results. They have NOT yet been met. ReguLens will empirically measure performance against these targets on the 25-case golden dataset during Phase 2 (Vertical Slice execution) and report all results honestly (including any failures) in the Gate 2 report per `QUALITY_GATES.md` Section 7.
+
+| Metric | Target Threshold | Measurement Methodology | Architectural & Business Rationale | Approval Status |
 |---|---|---|---|---|
-| **Citation Validity** | **100.0%** | Share of cited claims whose `official_url` resolves to an approved official source and whose snapshot hash matches. | AGENTS.md Rule 2 mandates zero invented or untraceable claims. A broken citation directly violates the product's core value proposition. | **PROPOSED** (Awaiting Founder Approval) |
-| **Citation Support** | **>= 98.0%** | Share of cited claims whose quoted source text, evaluated by human sample review, actually supports the substantive claim. | Minor phrasing nuances may occur, but legal obligations must be directly backed by the quoted text. | **PROPOSED** (Awaiting Founder Approval) |
-| **Requirement Extraction Precision** | **>= 95.0%** | $\frac{\text{True Positives}}{\text{True Positives} + \text{False Positives}}$ against expert golden dataset. | Prevents burdening exporters with irrelevant or non-applicable regulatory hurdles. | **PROPOSED** (Awaiting Founder Approval) |
-| **Requirement Extraction Recall** | **>= 95.0%** | $\frac{\text{True Positives}}{\text{True Positives} + \text{False Negatives}}$ against expert golden dataset. | Missing a critical EU check (e.g. 10% pesticide check or phytosanitary certificate) could result in container rejection at an EU border. | **PROPOSED** (Awaiting Founder Approval) |
-| **Unsupported-Claim Rate** | **Strictly 0.0%** | Invented, hallucinated, or ungrounded requirements shown to users. | Any occurrence is an immediate critical defect under `AGENTS.md` Rule 1. Zero tolerance. | **PROPOSED** (Awaiting Founder Approval) |
-| **Source Freshness** | **100.0%** | Share of displayed sources whose last verified date is within threshold (30d emergency, 90d general) OR displaying a visible degraded warning banner. | Prevents silent regulatory obsolescence under `AGENTS.md` Rule 4. | **PROPOSED** (Awaiting Founder Approval) |
+| **Citation Validity** | **100.0%** | Share of cited claims whose `official_url` resolves to an approved official source record and whose snapshot hash matches. | AGENTS.md Rule 2 mandates zero invented or untraceable claims. A broken citation directly violates the product's core value proposition. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
+| **Citation Support** | **>= 98.0%** | Share of cited claims whose quoted source text, evaluated by human sample review, actually supports the substantive claim. | Minor phrasing nuances may occur, but legal obligations must be directly backed by the quoted text. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
+| **Requirement Extraction Precision** | **>= 95.0%** | $\frac{\text{True Positives}}{\text{True Positives} + \text{False Positives}}$ against expert golden dataset. | Prevents burdening exporters with irrelevant or non-applicable regulatory hurdles. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
+| **Requirement Extraction Recall** | **>= 95.0%** | $\frac{\text{True Positives}}{\text{True Positives} + \text{False Negatives}}$ against expert golden dataset. | Missing a critical EU check (e.g. 10% pesticide check or phytosanitary certificate) could result in container rejection at an EU border. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
+| **Unsupported-Claim Rate** | **Strictly 0.0%** | Invented, hallucinated, or ungrounded requirements shown to users. | Any occurrence is an immediate critical defect under `AGENTS.md` Rule 1. Zero tolerance. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
+| **Source Freshness** | **100.0%** | Share of displayed sources whose last verified date is within threshold (30d emergency, 90d general) OR displaying a visible degraded warning banner. | Prevents silent regulatory obsolescence under `AGENTS.md` Rule 4. | **APPROVED TARGET** (Empirical measurement in Phase 2) |
 
 ---
 
-## 3. Golden Dataset Specification (PROPOSED)
+## 3. Golden Dataset Specification (APPROVED BY FOUNDER)
 
-### Proposed Size: 25 Curated & Verified Test Cases
-- **Domain:** Egyptian Agricultural Citrus Export to the European Union (CN `0805 10 00`).
+### Approved Size: 25 Curated & Verified Test Cases
+*(Approved by founder; to be curated and verified by a qualified human trade expert in Phase 2)*
+- **Domain:** Egyptian Agricultural Citrus Export to the European Union (CN `0805 10 00` — Fresh Valencia Oranges).
 - **Rationale for Size:** Sized specifically to cover all legal branches and document combinations relevant to Egyptian Valencia Oranges without unnecessary bulk:
   1. *Standard Compliant Consignments:* Clean phytosanitary certificate, clean pesticide lab report (< MRL for all active substances), valid EUR.1 certificate.
   2. *MRL Exceedance Scenarios:* Detected Chlorpyrifos, Dimethoate, or Lambda-cyhalothrin exceeding EU Regulation 396/2005 limits.
@@ -102,6 +108,20 @@ In accordance with `QUALITY_GATES.md` (Section 6), automated security tests must
 ### 4.3. Prompt Injection Test Suite (`tests/security/test_prompt_injection.py`)
 - Executes the `AIProviderAdapter` against synthetic lab reports containing adversarial system override directives.
 - Asserts that the adapter outputs structured JSON conforming to the Pydantic schema and does not follow the adversarial directive.
+
+### 4.4. Package C Document Storage & Pipeline Security Test Suite (`tests/integration/test_document_lifecycle.py`, `tests/unit/test_storage_service.py`)
+- **Upload-Time Size Enforcement & Provider Policy Verification:**
+  - Tests S3 presigned POST generation includes `["content-length-range", 1, 26214400]` and exact object-key match condition `{"key": object_key}`.
+  - Verifies exact key matching matches expected key, rejects appended suffixes (`object_key + "/extra"`), and rejects alternate keys under tenant prefix.
+  - Verifies S3 presigned POST failure fails closed (`StorageSecurityError`), asserting no presigned PUT fallback is ever generated.
+  - Tests server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{id}/upload-content`) delegates to `StorageService.stream_upload_object()`, aborts mid-stream on exceeding 25MB, and purges partial quarantine uploads without memory accumulation.
+- **Migration Downgrade & Upgrade Lifecycle Verification:**
+  - Verifies bidirectional Alembic migration cycles (`0004` <-> `0003`) against real PostgreSQL 16.
+  - Asserts that teardown routines track all cleanup errors without silent exception swallowing, verifying record deletion, Alembic version restoration to `0004_document_storage_fields`, and schema column integrity with explicit `pytest.fail()` diagnostics.
+- **Testing & Mocking Boundaries:**
+  - Automated CI tests run against `MemoryStorageService` and `MockMalwareScanner`.
+  - Live AWS S3 / GCP GCS and live ClamAV require production credentials not present in CI.
+  - Automated tests do NOT substitute for an independent human penetration test and security audit.
 
 ---
 

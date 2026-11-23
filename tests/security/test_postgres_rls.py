@@ -22,8 +22,10 @@ In accordance with AGENTS.md Rule 7, QUALITY_GATES.md, and Phase 1 Package A:
 """
 import os
 import socket
+import sys
 import uuid
-from datetime import timedelta
+import warnings
+from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Tuple
 
 import pytest
@@ -48,6 +50,7 @@ from app.db.models import (
     Consignment,
     Document,
     Product,
+    StorageCleanupTask,
     Tenant,
     TenantUser,
     User,
@@ -180,7 +183,8 @@ async def provisioned_tenants(
     try:
         yield (tenant_a, tenant_b, prod_a_id, prod_b_id)
     finally:
-        # 2. Teardown: Clean up in reverse dependency order
+        # 2. Teardown: Clean up in reverse dependency order without masking test failures
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -208,8 +212,12 @@ async def provisioned_tenants(
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_tenants after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_tenants teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -266,6 +274,7 @@ async def provisioned_hierarchy(
         mime_type="application/pdf",
         storage_key=f"tenants/{tenant_a}/docs/phyto_a.pdf",
         sha256_hash="a" * 64,
+        status="AVAILABLE",
         antivirus_status="CLEAN",
         parsing_status="PARSED",
     )
@@ -279,6 +288,7 @@ async def provisioned_hierarchy(
         mime_type="application/pdf",
         storage_key=f"tenants/{tenant_b}/docs/phyto_b.pdf",
         sha256_hash="b" * 64,
+        status="AVAILABLE",
         antivirus_status="CLEAN",
         parsing_status="PARSED",
     )
@@ -318,6 +328,7 @@ async def provisioned_hierarchy(
     try:
         yield hierarchy
     finally:
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -333,8 +344,12 @@ async def provisioned_hierarchy(
                 {"ta": str(tenant_a), "tb": str(tenant_b)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_hierarchy after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_hierarchy teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 # ==============================================================================
@@ -668,7 +683,7 @@ async def test_real_application_path_post_commit_integration(
 @pytest.mark.asyncio(loop_scope="function")
 async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSession):
     """Catalog Test: Verifies that every RLS policy using app.current_tenant_id or app.current_user_id contains NULLIF."""
-    # 1. Policies using app.current_tenant_id (13 policies across 12 tables)
+    # 1. Policies using app.current_tenant_id (14 policies across 13 tables including storage_cleanup_tasks)
     query_tenant = text("""
         SELECT tablename, policyname, cmd, qual, with_check
         FROM pg_policies
@@ -677,7 +692,7 @@ async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSessi
     """)
     res_tenant = await admin_session.execute(query_tenant)
     policies_tenant = res_tenant.all()
-    assert len(policies_tenant) == 13, f"Expected exactly 13 policies using app.current_tenant_id, found {len(policies_tenant)}"
+    assert len(policies_tenant) == 14, f"Expected exactly 14 policies using app.current_tenant_id, found {len(policies_tenant)}"
     for tablename, policyname, cmd, qual, with_check in policies_tenant:
         if qual and "app.current_tenant_id" in qual:
             assert "nullif" in qual.lower(), (
@@ -1082,6 +1097,7 @@ async def provisioned_multi_tenant_users(
     try:
         yield context
     finally:
+        test_exc = sys.exc_info()[1]
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -1097,8 +1113,12 @@ async def provisioned_multi_tenant_users(
                 {"u1": str(user_1_id), "u2": str(user_2_id), "u3": str(user_3_id)},
             )
             await admin_session.commit()
-        except Exception:
+        except Exception as cleanup_err:
             await admin_session.rollback()
+            if test_exc is not None:
+                warnings.warn(f"Teardown cleanup failed in provisioned_multi_tenant_users after test error: {cleanup_err}", RuntimeWarning)
+            else:
+                raise RuntimeError(f"Fixture provisioned_multi_tenant_users teardown failed to clean up test records: {cleanup_err}") from cleanup_err
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -1968,9 +1988,13 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
     alembic_cfg.set_main_option("script_location", str(alembic_dir))
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
-    # 1. Verify initial head precondition
+    # 1. Verify initial head precondition (ensuring starting at 0003 for this test)
     res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
     initial_version = res.scalar()
+    if initial_version in ("0004_document_storage_fields", "0005_storage_cleanup_outbox"):
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        initial_version = res.scalar()
     assert initial_version == "0003_membership_rls_policies", (
         f"Precondition failed: Expected 0003_membership_rls_policies, got {initial_version}"
     )
@@ -2042,10 +2066,10 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         t_down = policies_down["rls_tenants"]
         assert "nullif" in t_down.qual.lower(), "Restored rls_tenants missing NULLIF in qual"
 
-        # 6. Execute alembic upgrade head
+        # 6. Execute alembic upgrade to 0003
         # Commit session before running upgrade to ensure idle state
         await admin_session.commit()
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0003_membership_rls_policies")
 
         # 7. Verify expected Alembic revision after upgrade
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
@@ -2122,7 +2146,7 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         assert m_row.role == "OWNER"
 
     finally:
-        # Cleanup test data and ensure database is restored to 0003 head even if an assertion failed
+        teardown_errors = []
         try:
             await admin_session.rollback()
             await admin_session.execute(
@@ -2138,14 +2162,1235 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
                 {"id": str(test_user_id)},
             )
             await admin_session.commit()
-        except Exception:
-            await admin_session.rollback()
 
-        # Ensure alembic is at head if anything failed mid-downgrade
+            # Verify deletion
+            verify_del = await admin_session.execute(
+                text("SELECT count(*) FROM users WHERE id = :id"),
+                {"id": str(test_user_id)},
+            )
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test user {test_user_id}")
+        except Exception as e:
+            await admin_session.rollback()
+            teardown_errors.append(f"Error during record cleanup in test_migration_0003: {e}")
+
+        # Ensure alembic is restored to head
         try:
-            res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-            cur_ver = res.scalar()
-            if cur_ver != "0003_membership_rls_policies":
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-        except Exception:
-            pass
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version in test_migration_0003: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0003_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
+
+
+# ============================================================================
+# Migration 0004 Downgrade & Upgrade Lifecycle Verification Gate
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSession):
+    """Behavioral Gate: Alembic downgrade to 0003 and upgrade to 0004 cycle against PostgreSQL 16.
+
+    Verifies:
+    1. Precondition: Starts from Package C migration head (0004_document_storage_fields).
+    2. Verifies Package C columns and index exist on documents table.
+    3. Downgrades cleanly to 0003_membership_rls_policies.
+    4. Verifies Package C columns and index are dropped.
+    5. Re-upgrades to 0004_document_storage_fields / head.
+    6. Verifies Package C columns and index are restored.
+    """
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+    from app.core.config import settings
+
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+    settings.DATABASE_MIGRATION_URL = migration_url
+    os.environ["DATABASE_MIGRATION_URL"] = migration_url
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # 1. Ensure at 0004
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    cur_version = res.scalar()
+    if cur_version == "0005_storage_cleanup_outbox":
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+    elif cur_version != "0004_document_storage_fields":
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    assert res.scalar() == "0004_document_storage_fields"
+
+    # 2. Verify columns exist in 0004
+    col_res = await admin_session.execute(text("""
+        SELECT column_name, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'documents';
+    """))
+    cols_0004 = {row.column_name: row.is_nullable for row in col_res.fetchall()}
+    assert "status" in cols_0004
+    assert "quarantine_key" in cols_0004
+    assert "uploaded_by_user_id" in cols_0004
+    assert "rejection_reason" in cols_0004
+    assert "validated_at" in cols_0004
+    assert cols_0004["consignment_id"] == "YES"
+    assert cols_0004["sha256_hash"] == "YES"
+
+    # Verify index exists
+    idx_res = await admin_session.execute(text("""
+        SELECT indexname FROM pg_indexes
+        WHERE schemaname = 'public' AND tablename = 'documents' AND indexname = 'idx_documents_status';
+    """))
+    assert idx_res.scalar() == "idx_documents_status"
+
+    try:
+        # 3. Downgrade to 0003
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res_down = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_down.scalar() == "0003_membership_rls_policies"
+
+        # Verify columns removed
+        col_down = await admin_session.execute(text("""
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'documents';
+        """))
+        cols_0003 = {row.column_name: row.is_nullable for row in col_down.fetchall()}
+        assert "status" not in cols_0003
+        assert "quarantine_key" not in cols_0003
+        assert "uploaded_by_user_id" not in cols_0003
+        assert "rejection_reason" not in cols_0003
+        assert "validated_at" not in cols_0003
+        assert cols_0003["consignment_id"] == "NO"
+        assert cols_0003["sha256_hash"] == "NO"
+
+        # Verify index dropped
+        idx_down = await admin_session.execute(text("""
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'documents' AND indexname = 'idx_documents_status';
+        """))
+        assert idx_down.scalar() is None
+
+        # 4. Re-upgrade to 0004
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0004_document_storage_fields"
+
+        # Verify columns restored
+        col_up = await admin_session.execute(text("""
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'documents';
+        """))
+        cols_restored = {row.column_name: row.is_nullable for row in col_up.fetchall()}
+        assert "status" in cols_restored
+        assert "quarantine_key" in cols_restored
+        assert "uploaded_by_user_id" in cols_restored
+        assert "rejection_reason" in cols_restored
+        assert "validated_at" in cols_restored
+        assert cols_restored["consignment_id"] == "YES"
+        assert cols_restored["sha256_hash"] == "YES"
+
+    finally:
+        teardown_errors = []
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+
+            # Verify schema integrity (Package C columns restored on documents table)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key', 'uploaded_by_user_id', 'rejection_reason', 'validated_at');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            expected_cols = {'status', 'quarantine_key', 'uploaded_by_user_id', 'rejection_reason', 'validated_at'}
+            if restored_cols != expected_cols:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: restored columns {restored_cols} != expected {expected_cols}"
+                )
+        except Exception as e:
+            teardown_errors.append(f"Error during Alembic restoration/verification in teardown: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
+
+
+# ============================================================================
+# Migration 0004 Data-Bearing Downgrade & Upgrade Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_with_compatible_records_succeeds(
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Data-bearing migration test: Downgrade succeeds when all records have non-NULL consignment_id and sha256_hash."""
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    c_a_id = h["consignment_a_id"]
+
+    # Insert a valid, fully-populated record
+    test_doc_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status
+            ) VALUES (
+                :id, :tenant_id, :consignment_id, 'PHYTOSANITARY_CERTIFICATE', 'compatible.pdf', 1024,
+                'application/pdf', 'tenants/t1/documents/compat', :sha256, 'AVAILABLE', NULL, 'CLEAN'
+            )
+        """),
+        {
+            "id": str(test_doc_id),
+            "tenant_id": str(tenant_a),
+            "consignment_id": str(c_a_id),
+            "sha256": "e" * 64,
+        },
+    )
+    await admin_session.commit()
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    try:
+        # Ensure starting at 0004
+        res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        cur_v = res_cur.scalar()
+        if cur_v == "0005_storage_cleanup_outbox":
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        elif cur_v != "0004_document_storage_fields":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+
+        # Downgrade to 0003 with compatible records
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res.scalar() == "0003_membership_rls_policies"
+
+        # Re-upgrade to 0004
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0004_document_storage_fields"
+    finally:
+        # Clean up test document and ensure Alembic state is restored
+        teardown_errors = []
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
+            await admin_session.commit()
+
+            # Verify deletion
+            verify_del = await admin_session.execute(text("SELECT count(*) FROM documents WHERE id = :id"), {"id": str(test_doc_id)})
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test document {test_doc_id}")
+        except Exception as e:
+            teardown_errors.append(f"Error cleaning up test document {test_doc_id}: {e}")
+
+        # Ensure at head
+        try:
+            res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_check.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+
+            # Verify schema integrity (Package C columns restored)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            if restored_cols != {'status', 'quarantine_key'}:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: {restored_cols} != {{'status', 'quarantine_key'}}"
+                )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_with_compatible_records_succeeds: "
+                + "; ".join(teardown_errors)
+            )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Data-bearing migration test: Downgrade safely detects NULL values and aborts with actionable error."""
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+
+    # Insert a pre-consignment document record with NULL consignment_id and NULL sha256_hash
+    null_doc_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'unfinalized.pdf', 1024,
+                'application/pdf', 'tenants/t1/documents/unfin', NULL, 'PENDING_UPLOAD', 'tenants/t1/quarantine/unfin', 'PENDING'
+            )
+        """),
+        {"id": str(null_doc_id), "tenant_id": str(tenant_a)},
+    )
+    await admin_session.commit()
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    try:
+        # Ensure starting at 0004
+        res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        cur_v = res_cur.scalar()
+        if cur_v == "0005_storage_cleanup_outbox":
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        elif cur_v != "0004_document_storage_fields":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+        # Attempt downgrade; must raise RuntimeError with remediation message
+        with pytest.raises(Exception) as excinfo:
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
+
+        err_msg = str(excinfo.value)
+        assert "Cannot downgrade migration 0004_document_storage_fields" in err_msg
+        assert "contains 1 rows with NULL consignment_id" in err_msg
+        assert "Remediation: Associate unlinked documents with valid consignments" in err_msg
+
+        # Version must remain at 0004 because downgrade aborted
+        res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res.scalar() == "0004_document_storage_fields"
+    finally:
+        # Clean up the test NULL row and ensure Alembic state is restored
+        teardown_errors = []
+        try:
+            await admin_session.rollback()
+            await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
+            await admin_session.commit()
+
+            # Verify deletion
+            verify_del = await admin_session.execute(text("SELECT count(*) FROM documents WHERE id = :id"), {"id": str(null_doc_id)})
+            if verify_del.scalar() != 0:
+                teardown_errors.append(f"Failed to delete test NULL document {null_doc_id}")
+        except Exception as e:
+            teardown_errors.append(f"Error cleaning up test NULL document {null_doc_id}: {e}")
+
+        # Ensure alembic is restored to head
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+
+            # Verify schema integrity (Package C columns restored)
+            col_check = await admin_session.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'documents'
+                  AND column_name IN ('status', 'quarantine_key');
+            """))
+            restored_cols = {row[0] for row in col_check.fetchall()}
+            if restored_cols != {'status', 'quarantine_key'}:
+                teardown_errors.append(
+                    f"Schema integrity check failed during teardown: {restored_cols} != {{'status', 'quarantine_key'}}"
+                )
+        except Exception as e:
+            teardown_errors.append(f"Error verifying/restoring Alembic version: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0004_downgrade_aborts_safely_when_null_rows_present: "
+                + "; ".join(teardown_errors)
+            )
+
+
+# ============================================================================
+# Package C: Real PostgreSQL 16 RLS Document Lifecycle & Audit Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_read_or_list_tenant_b_documents(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot read single documents or list any documents belonging to Tenant B."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # 1. Single read attempt of Tenant B document returns None under unprivileged regulens_app
+    stmt_single = select(Document).where(Document.id == doc_b_id)
+    res_single = await db_session.execute(stmt_single)
+    assert res_single.scalar_one_or_none() is None, "RLS Violation: Tenant A was able to read Tenant B document!"
+
+    # 2. List all documents under Tenant A context only returns Tenant A documents
+    stmt_list = select(Document)
+    res_list = await db_session.execute(stmt_list)
+    docs = res_list.scalars().all()
+    assert len(docs) > 0, "Tenant A should see its own documents"
+    for d in docs:
+        assert d.tenant_id == tenant_a, f"RLS Violation: Found document with tenant_id={d.tenant_id} under Tenant A context!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_finalize_or_tamper_tenant_b_upload(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot update status, quarantine_key, or storage_key of Tenant B's document."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    # Attempt to finalize / tamper with Tenant B document affects 0 rows
+    res_update = await db_session.execute(
+        text("UPDATE documents SET status = 'AVAILABLE', quarantine_key = NULL WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert res_update.rowcount == 0, "RLS Violation: Tenant A updated Tenant B's document status!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_tenant_a_cannot_delete_tenant_b_document(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cannot delete Tenant B's document."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    doc_b_id = h["doc_b_id"]
+
+    await set_tenant_context(db_session, tenant_a)
+
+    res_delete = await db_session.execute(
+        text("DELETE FROM documents WHERE id = :id"),
+        {"id": str(doc_b_id)},
+    )
+    assert res_delete.rowcount == 0, "RLS Violation: Tenant A deleted Tenant B's document!"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_document_isolation_maintained_across_tenant_switching(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS: Switching transaction tenant context switches visibility cleanly without leakage."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+    doc_a_id = h["doc_a_id"]
+    doc_b_id = h["doc_b_id"]
+
+    # Context A
+    await set_tenant_context(db_session, tenant_a)
+    doc_a = (await db_session.execute(select(Document).where(Document.id == doc_a_id))).scalar_one_or_none()
+    assert doc_a is not None and doc_a.tenant_id == tenant_a
+    assert (await db_session.execute(select(Document).where(Document.id == doc_b_id))).scalar_one_or_none() is None
+
+    # Switch to Context B
+    await set_tenant_context(db_session, tenant_b)
+    doc_b = (await db_session.execute(select(Document).where(Document.id == doc_b_id))).scalar_one_or_none()
+    assert doc_b is not None and doc_b.tenant_id == tenant_b
+    assert (await db_session.execute(select(Document).where(Document.id == doc_a_id))).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_audit_events_tenant_isolated_and_append_only(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """PostgreSQL 16 RLS & Permissions: Audit logs are tenant-isolated and strictly append-only under regulens_app."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+
+    # 1. Admin seeds an audit log for Tenant B
+    audit_b_id = uuid.uuid4()
+    await admin_session.execute(
+        text("""
+            INSERT INTO audit_logs (id, tenant_id, action, resource_type, resource_id, details)
+            VALUES (:id, :tenant_id, 'DOCUMENT_UPLOAD_FINALIZED', 'document', :res_id, '{"doc": "secret"}')
+        """),
+        {"id": str(audit_b_id), "tenant_id": str(tenant_b), "res_id": str(uuid.uuid4())},
+    )
+    await admin_session.commit()
+
+    # 2. Tenant A connects under unprivileged regulens_app
+    await set_tenant_context(db_session, tenant_a)
+
+    # Tenant A cannot read Tenant B's audit log
+    audit_res = await db_session.execute(select(AuditLog).where(AuditLog.id == audit_b_id))
+    assert audit_res.scalar_one_or_none() is None, "RLS Violation: Tenant A read Tenant B's audit log!"
+
+    # 3. Tenant A seeds its own audit log via INSERT (permitted under append-only policy)
+    audit_a_id = uuid.uuid4()
+    await db_session.execute(
+        text("""
+            INSERT INTO audit_logs (id, tenant_id, action, resource_type, resource_id, details)
+            VALUES (:id, :tenant_id, 'DOCUMENT_UPLOAD_INITIATED', 'document', :res_id, '{"doc": "normal"}')
+        """),
+        {"id": str(audit_a_id), "tenant_id": str(tenant_a), "res_id": str(uuid.uuid4())},
+    )
+    await db_session.commit()
+
+    # 4. Attempting to UPDATE audit log is rejected by database permissions (SQLSTATE 42501)
+    await set_tenant_context(db_session, tenant_a)
+    with pytest.raises(DBAPIError) as exc_update:
+        await db_session.execute(
+            text("UPDATE audit_logs SET action = 'TAMPERED' WHERE id = :id"),
+            {"id": str(audit_a_id)},
+        )
+    assert exc_update.value.orig is not None
+    assert getattr(exc_update.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+    # 5. Attempting to DELETE audit log is rejected by database permissions (SQLSTATE 42501)
+    await set_tenant_context(db_session, tenant_a)
+    with pytest.raises(DBAPIError) as exc_delete:
+        await db_session.execute(
+            text("DELETE FROM audit_logs WHERE id = :id"),
+            {"id": str(audit_a_id)},
+        )
+    assert exc_delete.value.orig is not None
+    assert getattr(exc_delete.value.orig, "sqlstate", None) == "42501"
+    await db_session.rollback()
+
+    # Cleanup admin records
+    await admin_session.execute(
+        text("DELETE FROM audit_logs WHERE id IN (:id_a, :id_b)"),
+        {"id_a": str(audit_a_id), "id_b": str(audit_b_id)},
+    )
+    await admin_session.commit()
+
+
+# ============================================================================
+# Package C: Tenant-Scoped Quarantine Retention Cleanup RLS Tests
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_tenant_a_cannot_see_or_delete_tenant_b_quarantine_objects(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Tenant A cleanup cannot see, alter, or delete Tenant B quarantine objects."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in Tenant A, VIEWER in Tenant B
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # 1. Admin seeds an expired unfinalized document for Tenant B (30 hours old)
+    doc_b_id = uuid.uuid4()
+    q_b_key = f"tenants/{tenant_b}/quarantine/{doc_b_id.hex}"
+    storage.put_object(q_b_key, b"tenant_b_secret_quarantine_content")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'b_quarantine.pdf', 1024,
+                'application/pdf', 'tenants/b/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_b_id),
+            "tenant_id": str(tenant_b),
+            "q_key": q_b_key,
+            "created_at": now - timedelta(hours=30),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        # 2. Tenant A OWNER executes cleanup for Tenant A
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        # Scanned and purged counts for Tenant A are 0
+        assert report.scanned_count == 0
+        assert report.purged_count == 0
+        assert doc_b_id not in report.purged_document_ids
+
+        # 3. Tenant B's storage object is untouched
+        assert storage.object_exists(q_b_key) is True
+
+        # 4. Tenant B's database row is completely untouched
+        res_b = await admin_session.execute(
+            text("SELECT status, quarantine_key FROM documents WHERE id = :id"),
+            {"id": str(doc_b_id)},
+        )
+        row_b = res_b.mappings().first()
+        assert row_b is not None
+        assert row_b["status"] == "PENDING_UPLOAD"
+        assert row_b["quarantine_key"] == q_b_key
+
+        # 5. Cross-tenant attempt: User 1 attempts cleanup targeting Tenant B
+        # In Tenant B, User 1 is only a VIEWER -> must fail closed
+        with pytest.raises(PermissionError, match="Requires OWNER or ADMIN role"):
+            await purge_abandoned_quarantine_objects(
+                db=db_session,
+                tenant_id=tenant_b,
+                actor_user_id=user_1_id,
+                storage_service=storage,
+                cutoff_hours=24,
+            )
+    finally:
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_b_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_deletes_only_expired_quarantine_objects(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Tenant cleanup purges expired quarantine objects (>cutoff) and updates status to EXPIRED."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in Tenant A
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # Admin seeds an expired document for Tenant A (36 hours old)
+    doc_a_id = uuid.uuid4()
+    q_a_key = f"tenants/{tenant_a}/quarantine/{doc_a_id.hex}"
+    storage.put_object(q_a_key, b"tenant_a_abandoned_file")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'expired_a.pdf', 2048,
+                'application/pdf', 'tenants/a/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_a_id),
+            "tenant_id": str(tenant_a),
+            "q_key": q_a_key,
+            "created_at": now - timedelta(hours=36),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        # User 1 executes cleanup for Tenant A with 24h cutoff
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        assert report.scanned_count == 1
+        assert report.purged_count == 1
+        assert doc_a_id in report.purged_document_ids
+
+        # Storage object is purged
+        assert storage.object_exists(q_a_key) is False
+
+        # In DB under unprivileged regulens_app with Tenant A context: status is EXPIRED, quarantine_key is NULL
+        await set_tenant_context(db_session, tenant_a)
+        res_a = await db_session.execute(
+            text("SELECT status, quarantine_key, rejection_reason FROM documents WHERE id = :id"),
+            {"id": str(doc_a_id)},
+        )
+        row_a = res_a.mappings().first()
+        assert row_a is not None
+        assert row_a["status"] == "EXPIRED"
+        assert row_a["quarantine_key"] is None
+        assert "abandoned and exceeded the 24-hour retention window" in row_a["rejection_reason"]
+
+        # Immutable audit log was appended
+        audit_res = await db_session.execute(
+            text("""
+                SELECT action, resource_id, details
+                FROM audit_logs
+                WHERE tenant_id = :t_id AND resource_id = :r_id AND action = 'DOCUMENT_QUARANTINE_PURGED'
+            """),
+            {"t_id": str(tenant_a), "r_id": str(doc_a_id)},
+        )
+        audit_row = audit_res.mappings().first()
+        assert audit_row is not None
+        assert audit_row["action"] == "DOCUMENT_QUARANTINE_PURGED"
+    finally:
+        await admin_session.execute(text("DELETE FROM audit_logs WHERE resource_id = :id"), {"id": str(doc_a_id)})
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_a_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_preserves_active_uploads(
+    db_session: AsyncSession,
+    admin_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Active uploads (< cutoff_hours old) are strictly preserved from deletion."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    storage = MemoryStorageService()
+    now = datetime.now(timezone.utc)
+
+    # Admin seeds an active upload (2 hours old, cutoff is 24 hours)
+    doc_active_id = uuid.uuid4()
+    q_active_key = f"tenants/{tenant_a}/quarantine/{doc_active_id.hex}"
+    storage.put_object(q_active_key, b"tenant_a_active_file")
+
+    await admin_session.execute(
+        text("""
+            INSERT INTO documents (
+                id, tenant_id, consignment_id, document_type, file_name, file_size_bytes,
+                mime_type, storage_key, sha256_hash, status, quarantine_key, antivirus_status,
+                created_at
+            ) VALUES (
+                :id, :tenant_id, NULL, 'PHYTOSANITARY_CERTIFICATE', 'active_a.pdf', 1024,
+                'application/pdf', 'tenants/a/docs/pending', NULL, 'PENDING_UPLOAD', :q_key, 'PENDING',
+                :created_at
+            )
+        """),
+        {
+            "id": str(doc_active_id),
+            "tenant_id": str(tenant_a),
+            "q_key": q_active_key,
+            "created_at": now - timedelta(hours=2),
+        },
+    )
+    await admin_session.commit()
+
+    try:
+        report = await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+            cutoff_hours=24,
+        )
+
+        assert report.scanned_count == 0
+        assert report.purged_count == 0
+        assert doc_active_id not in report.purged_document_ids
+
+        # Object is preserved in storage
+        assert storage.object_exists(q_active_key) is True
+
+        # Database record remains PENDING_UPLOAD with quarantine_key intact
+        await set_tenant_context(db_session, tenant_a)
+        res_a = await db_session.execute(
+            text("SELECT status, quarantine_key FROM documents WHERE id = :id"),
+            {"id": str(doc_active_id)},
+        )
+        row_a = res_a.mappings().first()
+        assert row_a is not None
+        assert row_a["status"] == "PENDING_UPLOAD"
+        assert row_a["quarantine_key"] == q_active_key
+    finally:
+        await admin_session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": str(doc_active_id)})
+        await admin_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_rejected_for_unauthorized_or_viewer_actor(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """PostgreSQL 16 RLS: Cleanup is rejected for unauthorized actors, non-members, deactivated users, or VIEWER role."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    tenant_c = ctx["tenant_c_id"]
+    user_1_id = ctx["user_1_id"]  # OWNER in A, VIEWER in B, non-member in C
+    user_3_id = ctx["user_3_id"]  # Deactivated user in A
+    storage = MemoryStorageService()
+
+    # 1. Non-member actor (User 1 targeting Tenant C)
+    with pytest.raises(PermissionError, match="not an active member"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_c,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+        )
+
+    # 2. VIEWER role actor (User 1 targeting Tenant B)
+    with pytest.raises(PermissionError, match="Requires OWNER or ADMIN role"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_b,
+            actor_user_id=user_1_id,
+            storage_service=storage,
+        )
+
+    # 3. Deactivated user (User 3 targeting Tenant A)
+    with pytest.raises(PermissionError, match="account is deactivated"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_3_id,
+            storage_service=storage,
+        )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cleanup_fails_safely_when_tenant_context_missing(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Safety check: Cleanup fails immediately when tenant_id, actor_user_id, or cutoff_hours are invalid."""
+    from app.services.cleanup import purge_abandoned_quarantine_objects
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    # 1. Missing tenant_id
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=None,
+            actor_user_id=user_1_id,
+        )
+
+    # 2. Missing actor_user_id
+    with pytest.raises(ValueError, match="actor_user_id is required"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=None,
+        )
+
+    # 3. Non-positive cutoff_hours
+    with pytest.raises(ValueError, match="cutoff_hours must be a positive integer"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            cutoff_hours=0,
+        )
+
+    with pytest.raises(ValueError, match="cutoff_hours must be a positive integer"):
+        await purge_abandoned_quarantine_objects(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            cutoff_hours=-12,
+        )
+
+
+# ============================================================================
+# Migration 0005 Downgrade & Upgrade Lifecycle Verification Gate
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0005_downgrade_and_upgrade_cycle(admin_session: AsyncSession):
+    """Behavioral Gate: Alembic downgrade to 0004 and upgrade to 0005 cycle against PostgreSQL 16.
+
+    Verifies:
+    1. Precondition: Starts from Package C outbox migration head (0005_storage_cleanup_outbox).
+    2. Verifies storage_cleanup_tasks table, columns, indexes, and RLS exist.
+    3. Downgrades cleanly to 0004_document_storage_fields.
+    4. Verifies storage_cleanup_tasks table and indexes are dropped.
+    5. Re-upgrades to 0005_storage_cleanup_outbox / head.
+    6. Verifies storage_cleanup_tasks table, indexes, and RLS policies are restored.
+    """
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+    from app.core.config import settings
+
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+    settings.DATABASE_MIGRATION_URL = migration_url
+    os.environ["DATABASE_MIGRATION_URL"] = migration_url
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # 1. Ensure at 0005 head
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    assert res.scalar() == "0005_storage_cleanup_outbox"
+
+    # 2. Verify table exists in 0005
+    tbl_res = await admin_session.execute(text("""
+        SELECT count(*) FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+    """))
+    assert tbl_res.scalar() == 1
+
+    # Verify RLS enabled and forced
+    rls_res = await admin_session.execute(text("""
+        SELECT relrowsecurity, relforcerowsecurity
+        FROM pg_class
+        WHERE relname = 'storage_cleanup_tasks';
+    """))
+    row = rls_res.fetchone()
+    assert row is not None
+    assert row[0] is True  # relrowsecurity
+    assert row[1] is True  # relforcerowsecurity
+
+    try:
+        # 3. Downgrade to 0004
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        res_down = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_down.scalar() == "0004_document_storage_fields"
+
+        # Verify table dropped
+        tbl_down = await admin_session.execute(text("""
+            SELECT count(*) FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+        """))
+        assert tbl_down.scalar() == 0
+
+        # 4. Re-upgrade to head (0005)
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0005_storage_cleanup_outbox"
+
+        # Verify table and RLS restored
+        tbl_restored = await admin_session.execute(text("""
+            SELECT count(*) FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+        """))
+        assert tbl_restored.scalar() == 1
+
+        rls_restored = await admin_session.execute(text("""
+            SELECT relrowsecurity, relforcerowsecurity
+            FROM pg_class
+            WHERE relname = 'storage_cleanup_tasks';
+        """))
+        row_restored = rls_restored.fetchone()
+        assert row_restored[0] is True
+        assert row_restored[1] is True
+
+    finally:
+        teardown_errors = []
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error during Alembic restoration in test_migration_0005: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0005_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_storage_cleanup_tasks_cross_tenant_isolation(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Behavioral Test: Tenant A cannot read, update, or delete Tenant B's storage_cleanup_tasks, and cross-tenant INSERT is rejected."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+
+    # 1. Tenant A inserts task under its own tenant context
+    await set_tenant_context(db_session, tenant_a)
+    task_a_id = uuid.uuid4()
+    key_a = f"tenants/{tenant_a}/quarantine/test_a.pdf"
+
+    task_a = StorageCleanupTask(
+        id=task_a_id,
+        tenant_id=tenant_a,
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await set_tenant_context(db_session, tenant_a)
+
+    # 2. Positive control: Tenant A can read own task
+    stmt_own = select(StorageCleanupTask).where(StorageCleanupTask.id == task_a_id)
+    own_task = (await db_session.execute(stmt_own)).scalar_one_or_none()
+    assert own_task is not None
+    assert own_task.id == task_a_id
+
+    # 3. Switch to Tenant B: Tenant B CANNOT read Tenant A's task
+    await set_tenant_context(db_session, tenant_b)
+    res_b = (await db_session.execute(stmt_own)).scalar_one_or_none()
+    assert res_b is None, "Tenant B leaked Tenant A's storage_cleanup_tasks record under RLS!"
+
+    # 4. Negative control: Tenant B UPDATE against Tenant A's task affects 0 rows
+    stmt_tamper = text("""
+        UPDATE storage_cleanup_tasks
+        SET status = 'COMPLETED'
+        WHERE id = :id;
+    """)
+    tamper_res = await db_session.execute(stmt_tamper, {"id": str(task_a_id)})
+    assert tamper_res.rowcount == 0, "Tenant B tampered with Tenant A's storage_cleanup_task!"
+
+    # 5. Negative control: Tenant B DELETE against Tenant A's task affects 0 rows
+    stmt_del = text("DELETE FROM storage_cleanup_tasks WHERE id = :id;")
+    del_res = await db_session.execute(stmt_del, {"id": str(task_a_id)})
+    assert del_res.rowcount == 0, "Tenant B deleted Tenant A's storage_cleanup_task!"
+
+    # 6. Negative control: Tenant B attempting to INSERT a row with tenant_id = Tenant A is rejected by WITH CHECK
+    task_cross_insert = StorageCleanupTask(
+        id=uuid.uuid4(),
+        tenant_id=tenant_a,  # Forged foreign tenant
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="DOCUMENT_DELETION",
+        status="PENDING",
+    )
+    db_session.add(task_cross_insert)
+    with pytest.raises(DBAPIError) as exc_info:
+        await db_session.commit()
+    orig = getattr(exc_info.value, "orig", exc_info.value)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    assert sqlstate == "42501" or "violates row-level security policy" in str(orig).lower()
+    await db_session.rollback()
+
+    # Clean up Tenant A's task
+    await set_tenant_context(db_session, tenant_a)
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_a_id)})
+    await db_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_reconciliation_cross_tenant_isolation(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test: Storage reconciliation for Tenant A claims and processes only Tenant A's tasks, strictly ignoring Tenant B's tasks."""
+    from app.services.cleanup import reconcile_storage_cleanup_tasks
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    user_1_id = ctx["user_1_id"]  # Owner/Admin in Tenant A
+
+    storage = MemoryStorageService()
+
+    # 1. Seed Tenant A's task and object
+    key_a = f"tenants/{tenant_a}/quarantine/doc_a.pdf"
+    storage.put_object(key_a, b"data_a")
+    task_a_id = uuid.uuid4()
+    await set_tenant_context(db_session, tenant_a)
+    task_a = StorageCleanupTask(
+        id=task_a_id,
+        tenant_id=tenant_a,
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+
+    # 2. Seed Tenant B's task and object
+    key_b = f"tenants/{tenant_b}/quarantine/doc_b.pdf"
+    storage.put_object(key_b, b"data_b")
+    task_b_id = uuid.uuid4()
+    await set_tenant_context(db_session, tenant_b)
+    task_b = StorageCleanupTask(
+        id=task_b_id,
+        tenant_id=tenant_b,
+        storage_backend="memory",
+        object_key=key_b,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+
+    # 3. Execute reconciliation for Tenant A using Actor 1 (Tenant A Owner)
+    report = await reconcile_storage_cleanup_tasks(
+        db=db_session,
+        tenant_id=tenant_a,
+        actor_user_id=user_1_id,
+        storage_service=storage,
+    )
+
+    assert report.scanned_count == 1
+    assert report.completed_count == 1
+    assert task_a_id in report.task_ids_completed
+
+    # Object A is purged
+    assert not storage.object_exists(key_a)
+
+    # Object B remains INTACT and Tenant B's task remains PENDING
+    assert storage.object_exists(key_b)
+    await set_tenant_context(db_session, tenant_b)
+    stmt_check_b = select(StorageCleanupTask).where(StorageCleanupTask.id == task_b_id)
+    task_b_db = (await db_session.execute(stmt_check_b)).scalar_one_or_none()
+    assert task_b_db is not None
+    assert task_b_db.status == "PENDING"
+
+    # Cleanup test tasks
+    await set_tenant_context(db_session, tenant_b)
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_b_id)})
+    await db_session.commit()
+
+    await set_tenant_context(db_session, tenant_a)
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_a_id)})
+    await db_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_reconcile_fails_safely_when_inputs_or_roles_invalid(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Safety check: reconcile_storage_cleanup_tasks validates inputs and enforces OWNER/ADMIN live role."""
+    from app.services.cleanup import reconcile_storage_cleanup_tasks
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    # 1. Invalid limit
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            limit=0,
+        )
+
+    # 2. Missing tenant_id
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=None,
+            actor_user_id=user_1_id,
+        )
+
+    # 3. Missing actor_user_id
+    with pytest.raises(ValueError, match="actor_user_id is required"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=None,
+        )

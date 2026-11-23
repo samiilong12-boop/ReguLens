@@ -255,19 +255,24 @@ class Document(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    consignment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    consignment_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
     document_type: Mapped[str] = mapped_column(String(64), nullable=False)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
-    sha256_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    antivirus_status: Mapped[str] = mapped_column(String(32), nullable=False, default="NOT_SCANNED")
+    sha256_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING_UPLOAD")
+    antivirus_status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    quarantine_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    uploaded_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     parsing_status: Mapped[str] = mapped_column(String(32), nullable=False, default="UPLOADED")
     extracted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    consignment: Mapped["Consignment"] = relationship("Consignment", back_populates="documents")
+    consignment: Mapped[Optional["Consignment"]] = relationship("Consignment", back_populates="documents")
     evidence_items: Mapped[List["EvidenceItem"]] = relationship("EvidenceItem", back_populates="document")
 
     __table_args__ = (
@@ -280,6 +285,7 @@ class Document(Base):
         ),
         Index("idx_documents_tenant", "tenant_id"),
         Index("idx_documents_consignment", "tenant_id", "consignment_id"),
+        Index("idx_documents_status", "tenant_id", "status"),
     )
 
 
@@ -465,4 +471,38 @@ class AuditLog(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_audit_logs_tenant_id"),
         Index("idx_audit_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class StorageCleanupTask(Base):
+    """PostgreSQL-backed Storage Cleanup Outbox for durable object reconciliation.
+
+    In accordance with Package C and Storage Architecture:
+    - Retries failed post-commit storage deletions (Scenario A: finalization, Scenario B: deletion).
+    - Guarantees durable outbox records without introducing external message brokers.
+    - Tenant-isolated via PostgreSQL Row Level Security (RLS).
+    - Enforces bounded retries, exponential backoff, and concurrency control (SKIP LOCKED).
+    """
+    __tablename__ = "storage_cleanup_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    cleanup_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_storage_cleanup_tasks_tenant_id"),
+        Index("idx_storage_cleanup_due", "status", "next_retry_at"),
+        Index("idx_storage_cleanup_tenant", "tenant_id", "status"),
     )

@@ -1,9 +1,17 @@
 # ReguLens — System Architecture Document (Multi-Sector Corrected)
 
 ## Document Status
-- **Current Phase:** Phase 1 — Minimal Technical Foundation
-- **Strategic Scope:** Multi-Sector Architecture supporting both **Sector 1 (Agriculture & Agri-food)** and **Sector 2 (Textiles & Apparel)**
-- **Provisional Test Case:** Fresh Egyptian Valencia Oranges (CN `0805 10 00`) to EU serves strictly as a provisional engineering test case for early validation.
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Packages A, B, and C implemented in Draft PRs #1, #2, #3; Gate 1 unclosed pending external security review and founder sign-off)
+- **Strategic Scope:** Multi-Sector Architecture supporting both **Sector 1 (Agriculture & Agri-food)** and **Sector 2 (Textiles & Apparel)** as the long-term platform vision.
+- **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Formally approved by the founder as the first vertical slice to prove end-to-end multi-regime regulatory discovery, gap analysis, and dossier compilation. The multi-sector strategy is preserved as the strategic expansion path for Phase 3 and beyond, subject to exporter validation and trade data.
+- **Approved Acceptance Targets (Targets Approved by Founder; NOT Achieved Results):**
+  - Citation Validity: 100%
+  - Citation Support: ≥98%
+  - Requirement Extraction Precision: ≥95%
+  - Requirement Extraction Recall: ≥95%
+  - Unsupported-Claim Rate: 0%
+  - Source Freshness: 100% within defined thresholds, otherwise a visible degraded-status warning.
+  - Golden Dataset: 25 curated, human-verified test cases.
 - **Architectural Principle:** Minimal Technology (`AGENTS.md` Rule 15 & `QUALITY_GATES.md` Section 5)
 - **Security Boundary Notice:** PostgreSQL Row Level Security (RLS) is an additional database-engine authorization boundary, NOT cryptographic tenant isolation.
 
@@ -97,10 +105,38 @@ graph TD
 
 ---
 
-## 5. Security & Antivirus Status Disclosure
+## 5. Secure Document Storage & Upload Pipeline (Package C)
 
-- **Storage Security:** 100% private S3 buckets; zero public URLs. Access granted exclusively via short-lived signed URLs (15 minutes).
-- **Upload Validation:** Server-side magic-byte inspection (`python-magic`), 25MB file size limits, and randomized storage keys.
-- **Antivirus Status:**
-  - *Production Target:* ClamAV container daemon scanning uploaded streams before parsing.
-  - *Development Limitation Notice:* In local developer environments without Docker, ClamAV is not installed. Safe parsing in an unprivileged process and strict magic-byte validation are enforced locally. Magic-byte checking is NOT claimed to be equivalent to antivirus scanning.
+- **Storage Abstraction:** Provider-independent `StorageService` interface implemented across:
+  - `MemoryStorageService`: In-memory dictionary storage with size checking for fast, isolated CI testing.
+  - `LocalStorageService`: Development filesystem storage with strict path-traversal prevention.
+  - `S3StorageService`: AWS S3 / MinIO object storage with mandatory SSL in production, presigned POST upload policies with `content-length-range` enforcement and exact object-key condition `{"key": object_key}`, fail-closed handling on error (raising `StorageSecurityError` without presigned PUT fallback), and startup verification of Public Access Block configuration (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`).
+  - `GCSStorageService`: Google Cloud Storage adapter (GCP compatibility per ADR 0008) supporting signed URLs, bounded streaming reads, and verification of Uniform Bucket-Level Access (UBLA) and Public Access Prevention (PAP).
+- **Private Storage Invariant:** 100% private bucket; zero public ACLs or public URLs. All client upload and download access operates exclusively through short-lived presigned URLs (15-minute expiry) or bounded API endpoints.
+- **Transport Security:** Production and staging environments strictly require HTTPS/SSL (`S3_USE_SSL=True`); insecure `http://` endpoint URLs raise fail-closed configuration errors at startup.
+- **Opaque Key Strategy:** User-supplied filenames are never used in object storage paths. Keys are strictly randomized and tenant-partitioned:
+  - Quarantine: `tenants/{tenant_id}/quarantine/{opaque_uuid}`
+  - Permanent: `tenants/{tenant_id}/documents/{opaque_uuid}`
+- **Upload Size Enforcement & Memory Exhaustion Protection:**
+  - Hard cap of **25 MB** (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`).
+  - Enforced at upload transport level: S3 provider policy restricts uploads via `content-length-range` condition in presigned POST; for GCS where signed PUT URLs cannot enforce content-length policies at the provider boundary, `supports_direct_upload = False` and clients are directed to the authenticated server-mediated bounded streaming upload endpoint (`POST /api/v1/documents/{document_id}/upload-content`). This endpoint delegates directly to the bounded streaming-write interface on `StorageService` (`stream_upload_object`), which enforces byte limits per chunk with backpressure, aborts immediately upon exceeding 25MB without memory accumulation, and purges partial quarantine uploads on error.
+  - During finalization, server inspects object metadata (`get_object_metadata`) to verify size *before* reading payload into memory, preventing memory exhaustion (DoS). Oversized objects in quarantine are safely deleted and rejected with HTTP 400.
+- **Two-Phase Upload Lifecycle:**
+  1. *Initiation (`POST /documents/initiate-upload`):* Requires Owner, Admin, or Compliance Officer role. Creates document record in `PENDING_UPLOAD` status and issues an upload transport payload (direct S3 presigned URL or server-mediated `/upload-content` endpoint with 15-minute expiry).
+  2. *Client Upload:* Client streams bytes to the presigned quarantine URL (S3) or server-mediated endpoint (GCS).
+  3. *Finalization & Validation (`POST /documents/{id}/finalize-upload`):* Server verifies size from metadata, fetches raw bytes with strict `max_bytes` limit, executes file signature inspection (magic-byte detection for approved MIME types: `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`), and verifies SHA-256 checksum integrity.
+  4. *Malware Scanning Subsystem:* Dispatches to `BaseMalwareScanner`:
+     - *Clean Scan (Copy-Commit-Purge):* Promotes object to permanent storage via `copy_object`, commits document row and audit records within the database transaction, then purges the quarantine object post-commit. On database commit failure, transaction rolls back safely with quarantine file intact, allowing client retry without data corruption.
+     - *Infected Scan (EICAR / Virus):* Deletes quarantined file immediately, sets status to `REJECTED`, `antivirus_status` to `INFECTED`, records virus signature, and returns HTTP 422.
+     - *Scanner Unavailability / Error:* Fails safe with HTTP 503; document remains `QUARANTINED` and is NEVER marked clean or available.
+- **Storage / Database Consistency:**
+  - Distributed atomicity between PostgreSQL and object storage is not claimed. Finalization uses Copy-Commit-Purge (retry-safe, non-destructive to quarantine on commit failure). Document deletion uses Commit-Purge (database record deleted within transaction first; storage objects purged post-commit).
+- **Bounded Disk Spooling for Cloud Streaming:**
+  - Incoming streams in `S3StorageService.stream_upload_object` and `GCSStorageService.stream_upload_object` are spooled to temporary files created with `0600` permissions (`tempfile.mkstemp` and `os.chmod`), enforcing 25MB limits chunk-by-chunk. Spool files are reliably unlinked in all cases within `finally:` blocks.
+- **Quarantine Retention & Pruning:** Abandoned quarantine objects older than 24 hours are safely purged by `purge_abandoned_quarantine_objects()` in `apps/api/app/services/cleanup.py`, operating strictly under tenant-scoped PostgreSQL RLS with live role verification (OWNER or ADMIN). Runnable via CLI (`python -m app.services.cleanup --tenant-id <UUID> --actor-user-id <UUID> --cutoff-hours 24`), preserving active uploads under 24 hours.
+- **Secure Download Gate:** Presigned GET URLs (15-min expiry) are generated only for documents where `status == "AVAILABLE"` and `antivirus_status == "CLEAN"`. All unvalidated, quarantined, rejected, or infected documents return HTTP 403 Forbidden.
+- **Audit Logging & Secret Redaction:** Append-only audit records are written on initiation, finalization, download URL generation, deletion, and cleanup events. All presigned URLs, query signatures, tokens, and passwords are sanitized before audit persistence.
+- **Antivirus Engine Disclosure:**
+  - *Production Target:* `ClamAVScanner` connecting over TCP (`zINSTREAM` protocol) with fail-closed timeout and connection error handling. Production/staging strictly rejects `MockMalwareScanner`.
+  - *Testing / CI Engine:* `MockMalwareScanner` with built-in EICAR antivirus test signature detection and configurable failure simulation.
+  - *Operational Notice:* Magic-byte checking is NOT claimed to be equivalent to antivirus scanning. Live ClamAV daemon connectivity and properly configured cloud buckets are required for production certification.

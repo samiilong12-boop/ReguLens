@@ -58,6 +58,16 @@ graph TD
 | **Denial of Service** | T-DS-02 | AI API Abuse | Attacker repeatedly uploads documents to exhaust external AI API quotas and incur huge billing costs. | HIGH | Per-tenant rate limiting (max 50 document extractions per day in MVP); caching extracted text hashes to prevent re-processing identical files. | LOW |
 | **Elevation of Privilege**| T-EP-01 | Multi-Tenant DB | Attacker passes modified `tenant_id` in JSON payload to update another company's product. | CRITICAL | `tenant_id` is extracted strictly from the verified JWT server session context, NEVER from user request bodies or query params. RLS verifies DB session variable. | MINIMAL |
 | **Elevation of Privilege**| T-EP-02 | PDF Generator (SSRF / LFI) | Attacker embeds `<iframe src="http://169.254.169.254">` or `file:///etc/passwd` inside product description rendered into PDF report. | HIGH | PDF generation engine (WeasyPrint) configured with `enable_local_file_access=False` and external network fetch completely disabled. | MINIMAL |
+| **Tampering** | T-TM-04 (T-009) | Storage / Validation | Attacker uploads executable/script renamed with `.pdf` extension. | HIGH | Server-side binary magic-byte inspection (`file_validation.py`) enforces that payload matches whitelisted signatures (`application/pdf`, `image/png`, `image/jpeg`, `image/tiff`). | MINIMAL |
+| **Tampering** | T-TM-05 (T-010) | Storage / Scanner | Attacker uploads malicious file containing virus/trojan/EICAR payload. | HIGH | Two-phase upload isolates uploads to `tenants/{tenant_id}/quarantine/{uuid}`. Fail-safe ClamAV scanning runs before promotion. Detected malware purges file and marks record `QUARANTINED`. Scanner errors raise HTTP 503; never silently marked clean. | LOW |
+| **Denial of Service** | T-DS-03 (T-011) | Storage Service | Attacker attempts to flood storage with massive files. | HIGH | File size capped at 25 MB (`MAX_DOCUMENT_SIZE_BYTES = 26,214,400`); enforced via S3 presigned POST `content-length-range` condition, and for GCS via mandatory server-mediated bounded upload endpoint (`POST /api/v1/documents/{id}/upload-content`) using `stream_upload_object()` to reject oversized payloads at upload time without buffering. | MINIMAL |
+| **Tampering** | T-TM-07 | S3 POST Policy Key Hijacking | Attacker alters form key parameter in presigned POST to write arbitrary suffixes (`object_key + '/extra'`) or overwrite other keys. | HIGH | Exact object-key match condition `{"key": object_key}` enforced in S3 POST policy conditions; `starts-with` pattern rejected. | MINIMAL |
+| **Denial of Service** | T-DS-05 | S3 Fallback Degradation | Attacker causes S3 POST generation to fail to trigger an unrestricted presigned PUT fallback without size policy. | HIGH | Fail-closed architecture (`StorageSecurityError`); presigned PUT fallback is completely eliminated. | MINIMAL |
+| **Elevation of Privilege** | T-EP-03 | Retention Cleanup | Attacker triggers quarantine cleanup to purge or access another tenant's files or active uploads. | HIGH | Cleanup operates under transaction-scoped PostgreSQL RLS (`regulens_app`); requires explicit `tenant_id` and authorized actor with `OWNER` or `ADMIN` role; enforces tenant prefix check (`tenants/{tenant_id}/quarantine/`); active uploads (< 24h) preserved. | MINIMAL |
+| **Denial of Service** | T-DS-04 | Finalization / Memory | Attacker uploads oversized file to quarantine; server exhausts RAM attempting to validate payload. | HIGH | Pre-read metadata check (`get_object_metadata`) rejects and purges oversized files before loading into memory; bounded `get_object(..., max_bytes=26214400)` restricts memory allocation. | MINIMAL |
+| **Information Disclosure** | T-ID-04 (T-012) | Storage / Download | Attacker attempts to download unvalidated, infected, or other tenant's documents directly or via presigned URL tampering. | CRITICAL | Signed download URLs (15-min expiry) generated strictly after RLS query check and status verification (`status == AVAILABLE`). Unvalidated or infected documents return HTTP 403. S3/GCS bucket public access 100% blocked. | MINIMAL |
+| **Information Disclosure** | T-ID-05 | Transport / Bucket Config | Attacker intercepts cleartext storage traffic or accesses misconfigured public bucket. | HIGH | Enforced HTTPS/SSL (`S3_USE_SSL=True`); startup `verify_bucket_configuration()` asserts S3 PublicAccessBlock (all 4 flags True) or GCS UBLA (`uniform_bucket_level_access_enabled=True`) and PAP (`enforced`). | MINIMAL |
+| **Tampering** | T-TM-06 (T-013) | Storage Keys | Attacker injects path traversal sequences (e.g. `../../etc/passwd`) in filename. | HIGH | Storage keys use server-generated opaque UUIDs (`tenants/{tenant_id}/documents/{uuid}`). Original filename stored strictly as non-path database metadata. | MINIMAL |
 
 ---
 
@@ -105,6 +115,14 @@ graph TD
   1. **HTML Sanitization:** All user-supplied text rendered into the PDF report template is escaped using Jinja2 auto-escaping (`autoescape=True`).
   2. **Disabled Network and Local File Access:** WeasyPrint URL fetcher is overridden with a dummy fetcher that rejects all network (`http://`, `https://`) and file (`file://`) URI schemes. Assets (logos, CSS) are loaded strictly from verified, static local asset paths bundled in the application package.
 
+### Abuse Case 4: Storage Quarantine Bypass & Direct Malicious Download
+- **Attack Vector:** An attacker initiates an upload for an infected or unvalidated file, bypasses finalization or uploads malware, then attempts to directly generate a download URL or access the raw storage key to distribute malware to export compliance reviewers.
+- **Defenses:**
+  1. **Quarantine Isolation:** Initial uploads land exclusively under `tenants/{tenant_id}/quarantine/{uuid}` with `status = PENDING_VALIDATION`.
+  2. **Strict Download Gating:** The download URL endpoint (`/api/v1/documents/{id}/download-url`) explicitly checks `document.status == AVAILABLE`. Files in `PENDING_VALIDATION`, `QUARANTINED`, or `FAILED` status return `HTTP 403 Forbidden`.
+  3. **Malware Purge on Detection:** If ClamAV detects malware during finalization, the file is immediately purged from quarantine storage, preventing persistent residence.
+  4. **Fail-Safe Scanner:** If the ClamAV scanner service is offline or unreachable, the system raises `ScannerUnavailableError` (HTTP 503) and never marks the document as clean.
+
 ---
 
 ## 4. Security Verification & Test Plan
@@ -115,9 +133,19 @@ In accordance with `.agents/rules/QUALITY_GATES.md` (Section 6), automated secur
    - Tenant A creates product, consignment, document, and gap analysis.
    - Tenant B sends authenticated requests attempting to read, update, and delete Tenant A's resources.
    - Assert all return `404 Not Found`.
-2. **Prompt Injection Test Suite:**
+2. **Document Storage Lifecycle & Security Suite (`tests/integration/test_document_lifecycle.py`):**
+   - Verify two-phase upload lifecycle (initiate -> upload -> finalize).
+   - Assert magic-byte validation rejects forged extensions (HTTP 400).
+   - Assert SHA-256 hash mismatch rejection (HTTP 400).
+   - Assert file size > 25MB rejection (HTTP 400).
+   - Assert malware detection rejects payload, purges file, and marks `QUARANTINED` (HTTP 422).
+   - Assert scanner offline / timeout returns fail-safe error (HTTP 503).
+   - Assert download URL generation blocked for unvalidated or quarantined files (HTTP 403).
+   - Assert cross-tenant download URL generation and deletion blocked (HTTP 404).
+   - Assert deletion physically purges storage and database records.
+3. **Prompt Injection Test Suite:**
    - Feed synthetic PDF files containing 10 known prompt injection payloads to the extraction service.
    - Assert that the output conforms strictly to the Pydantic schema and does NOT reflect the injected directive.
-3. **SSRF & File Path Traversal Test Suite:**
+4. **SSRF & File Path Traversal Test Suite:**
    - Attempt to generate a PDF report containing AWS metadata IP (`169.254.169.254`) and `file:///etc/passwd`.
    - Assert zero external requests and zero local file reads occur.

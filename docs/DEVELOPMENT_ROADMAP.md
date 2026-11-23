@@ -1,7 +1,18 @@
 # ReguLens — Development Roadmap & Milestone Plan
 
 ## Document Status
-- **Current Phase:** Phase 0B — Technical Architecture & MVP Definition
+- **Current Phase:** Phase 1 — Minimal Technical Foundation (In Progress: Package A & Package B complete in Draft PRs; Package C pending)
+- **Selected First Vertical Slice (Phase 2):** **Fresh Egyptian Valencia Oranges (CN `0805 10 00`) exported to the European Union (EU-27)**. Formally approved by the founder as the first vertical slice to validate the end-to-end user journey across multi-regime checks.
+- **Future Expansion Direction:** The broader multi-sector strategy (citrus + strawberries, ready-made garments, children's apparel) remains the overall product architecture and strategic expansion direction for Phase 3 and later, subject to post-slice customer interviews and Eurostat Comext trade evidence. Do not silently change the overall product strategy.
+- **Approved Acceptance Targets (Targets Approved by Founder; NOT Achieved Results):**
+  - Citation Validity: 100%
+  - Citation Support: ≥98%
+  - Requirement Extraction Precision: ≥95%
+  - Requirement Extraction Recall: ≥95%
+  - Unsupported-Claim Rate: 0%
+  - Source Freshness: 100% within defined freshness thresholds, otherwise a visible degraded-status warning.
+  - Golden Dataset: 25 curated, human-verified test cases.
+  *(Note: These are approved targets, NOT achieved results. They must be empirically measured on the golden dataset during Phase 2).*
 - **Governance Reference:** `phases/ROADMAP.md` is the sole authority on phase ordering. This document adds milestones, technical deliverables, and exit details inside that order without reordering phases.
 - **Rule:** Stop at every gate and wait for the founder's explicit written approval.
 
@@ -11,8 +22,8 @@
 
 ```mermaid
 graph LR
-    P0A["Phase 0A: Research & Validation<br>(Completed & Audited)"] --> P0B["Phase 0B: Architecture & MVP Plan<br>(Current Phase)"]
-    P0B -->|Gate B Approval| P1["Phase 1: Minimal Technical Foundation<br>(Auth, RLS, Storage, CI)"]
+    P0A["Phase 0A: Research & Validation<br>(Completed & Audited)"] --> P0B["Phase 0B: Architecture & MVP Plan<br>(READY FOR FOUNDER SIGN-OFF)"]
+    P0B -->|Gate B Approval| P1["Phase 1: Minimal Technical Foundation<br>(PARTIAL — Pkgs A & B in Draft PRs; Pkg C Pending)"]
     P1 -->|Gate 1 Approval| P2["Phase 2: Vertical Slice<br>(Egyptian Oranges to EU)"]
     P2 -->|Gate 2 + Expert Review| P3["Phase 3: Expansion<br>(Strawberries, Apparel, Billing)"]
     P3 -->|Gate 3 Approval| P4["Phase 4: Hardening & Scale<br>(Enterprise, Multi-Lane)"]
@@ -28,7 +39,8 @@ graph LR
 
 ---
 
-### Phase 0B: Technical Architecture & MVP Definition (CURRENT)
+### Phase 0B: Technical Architecture & MVP Definition (READY FOR FOUNDER SIGN-OFF)
+- **Status:** READY FOR FOUNDER SIGN-OFF — final founder review pending. Architecture, PRD, database schema, threat model, security model, data retention, draft privacy policy, test strategy, and ADRs (0001–0008) delivered. Founder has approved quantitative acceptance targets and the first vertical slice.
 - **Goal:** Define product requirements, minimal architecture, database schema, security model, threat model, data retention, draft privacy policy, and test strategy sized strictly to the Vertical Slice.
 - **Deliverables:**
   - `docs/PRODUCT_REQUIREMENTS.md` (PRD with 8-step journey, JTBD, user stories)
@@ -37,37 +49,47 @@ graph LR
   - `docs/SECURITY_ARCHITECTURE.md` (Multi-layer defense, secrets, audit logging)
   - `docs/THREAT_MODEL.md` (STRIDE threat model, prompt injection defenses)
   - `docs/REGULATORY_DATA_POLICY.md` (Source tiers, verification, licensing)
-  - `docs/TEST_STRATEGY.md` (Test pyramid, PROPOSED metrics & golden dataset)
+  - `docs/TEST_STRATEGY.md` (Test pyramid, APPROVED targets & golden dataset specification)
   - `docs/DATA_RETENTION_POLICY.md` & `docs/PRIVACY_POLICY_DRAFT.md` (Drafts)
   - `docs/DEVELOPMENT_ROADMAP.md` (This document)
   - `docs/OPEN_QUESTIONS.md` (Open ambiguities with recommended defaults)
-  - ADRs in `docs/adr/` (`0001` through `0007`)
-- **Exit Gate (Gate B):** Founder reviews all Phase 0B deliverables and provides explicit written approval before any code or package initialization occurs.
+  - ADRs in `docs/adr/` (`0001` through `0008`)
+- **Exit Gate (Gate B):** READY FOR FOUNDER SIGN-OFF — final founder review pending.
 
 ---
 
-### Phase 1: Minimal Technical Foundation (NEXT PHASE)
+### Phase 1: Minimal Technical Foundation (READY FOR FOUNDER SIGN-OFF)
 - **Entry Condition:** Gate B written approval from founder.
+- **Status:** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented in Draft PRs (#1, #2, #3); test suite expanded to 119 tests; remaining CI gaps documented; awaiting final founder sign-off.
 - **Goal:** Build and verify the secure, testable multi-tenant foundation without application business logic.
-- **Technical Milestones:**
-  - **M1.1: Project Scaffolding & Monorepo Setup:**
-    - Next.js 15 (TypeScript) frontend repository initialization.
-    - FastAPI (Python 3.12) backend repository initialization with Pydantic v2 and SQLAlchemy 2.0.
-    - Docker Compose for local PostgreSQL 16 and MinIO object storage.
-  - **M1.2: Database & Tenant Isolation (RLS):**
-    - Alembic migrations for `tenants`, `users`, `tenant_users`, and `audit_logs`.
-    - PostgreSQL RLS policies enabled and enforced.
-    - Automated tenant isolation test suite passing in CI.
-  - **M1.3: Authentication & Authorization:**
-    - Session JWT in HttpOnly secure cookies.
-    - RBAC middleware (`Owner`, `Admin`, `Compliance Officer`, `Reviewer`, `Viewer`).
-    - Negative authorization integration tests.
-  - **M1.4: Private File Storage Pipeline:**
-    - S3 integration with pre-signed temporary URLs (15-min expiry).
-    - MIME magic-byte validation and ClamAV scanning integration.
-  - **M1.5: Continuous Integration (CI):**
-    - GitHub Actions pipeline running linting (Ruff, ESLint), type-checking (MyPy, TypeScript), unit tests, and security tests on every commit.
-- **Exit Gate (Gate 1):** Working foundation; 100% test pass rate; zero code vulnerabilities; written founder sign-off.
+- **Work Package Structure & Milestones:**
+  - **Package A: Multi-Tenant RLS Session Context & GUC Enforcement (COMPLETED in Draft PR #1):**
+    - Transaction-local GUC configuration (`app.current_tenant_id`, `app.current_user_id`).
+    - PostgreSQL connection checkout/checkin listener with reset on pool return.
+    - Defensive `SessionLocal` guard raising `RuntimeError` if invoked without explicit tenant/user context.
+    - Alembic migrations 0001 & 0002.
+    - Verified by CI Run #43624757872.
+  - **Package B: Token-Bound Multi-Tenant Switching & Live Role Authorization (COMPLETED in Draft PR #2):**
+    - Tenant discovery (`GET /auth/memberships`).
+    - Token-bound tenant switching (`POST /auth/switch-tenant`) issuing tenant-scoped access tokens.
+    - Live role authorization via `get_current_tenant_user` and `require_owner` preventing privilege escalation from stale JWT role claims.
+    - User-scoped RLS policies on `tenants` and `tenant_users` via Alembic migration 0003.
+    - Full FastAPI dependency chain integration tests (`tests/integration/test_fastapi_tenant_authorization.py`).
+    - Verified by CI Run #43624757872 (82 passed tests, 44 RLS security tests).
+  - **Package C: Private File Storage Pipeline & Upload Security (COMPLETED in Draft PR #3):**
+    - S3 and GCS private storage integration (ADR 0008) with pre-signed temporary URLs (15-min expiry) and enforced HTTPS/SSL.
+    - Production fail-closed validation: rejects in-memory/local storage and mock scanners in staging/production.
+    - S3 PublicAccessBlock and GCS UBLA/PAP verification at application startup.
+    - Upload-time size enforcement (25MB hard cap) via S3 presigned POST `content-length-range`; for GCS, direct presigned uploads are disabled and uploads use the authenticated server-mediated bounded streaming upload endpoint (`/upload-content`).
+    - Pre-read memory exhaustion protection: metadata size inspection before loading quarantine payload into RAM.
+    - MIME magic-byte validation (`file_validation.py`) and SHA-256 payload checksum verification on upload.
+    - Malware scanning subsystem (`scanner.py`, `ClamAVScanner`, `MockMalwareScanner` detecting EICAR, fail-safe error handling).
+    - Two-phase upload lifecycle (`initiate-upload`, `finalize-upload`) with quarantine isolation.
+    - Quarantine retention cleanup: tenant-scoped `purge_abandoned_quarantine_objects()` in `cleanup.py` pruning abandoned uploads older than 24 hours under PostgreSQL RLS and live `OWNER`/`ADMIN` role verification while preserving active uploads.
+    - Authenticated download URL generation with status check and role-based deletion with storage purge.
+    - Alembic migration `0004_document_storage_fields.py` with safe downgrade guard against data loss on NULL records.
+    - 22 integration tests, 73 unit tests, and 57 PostgreSQL 16 RLS security tests (152 total tests, 100% pass rate).
+  - **Exit Gate (Gate 1):** READY FOR FOUNDER SIGN-OFF — Packages A, B, and C implemented and security-remediated in Draft PRs (#1, #2, #3); remaining CI and verification gaps documented; awaiting founder sign-off.
 
 ---
 
