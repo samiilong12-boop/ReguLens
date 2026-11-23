@@ -472,3 +472,37 @@ class AuditLog(Base):
         UniqueConstraint("tenant_id", "id", name="uq_audit_logs_tenant_id"),
         Index("idx_audit_tenant_created", "tenant_id", "created_at"),
     )
+
+
+class StorageCleanupTask(Base):
+    """PostgreSQL-backed Storage Cleanup Outbox for durable object reconciliation.
+
+    In accordance with Package C and Storage Architecture:
+    - Retries failed post-commit storage deletions (Scenario A: finalization, Scenario B: deletion).
+    - Guarantees durable outbox records without introducing external message brokers.
+    - Tenant-isolated via PostgreSQL Row Level Security (RLS).
+    - Enforces bounded retries, exponential backoff, and concurrency control (SKIP LOCKED).
+    """
+    __tablename__ = "storage_cleanup_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    cleanup_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_storage_cleanup_tasks_tenant_id"),
+        Index("idx_storage_cleanup_due", "status", "next_retry_at"),
+        Index("idx_storage_cleanup_tenant", "tenant_id", "status"),
+    )

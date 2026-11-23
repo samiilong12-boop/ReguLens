@@ -80,6 +80,11 @@ class StorageService(ABC):
         """Indicates whether this storage backend supports genuine provider-level upload-time size enforcement."""
         return True
 
+    @property
+    def backend_name(self) -> str:
+        """Identifier name of the storage backend."""
+        return "unknown"
+
     @abstractmethod
     def generate_presigned_upload_url(
         self,
@@ -160,6 +165,10 @@ class StorageService(ABC):
 
 class MemoryStorageService(StorageService):
     """In-memory, thread-safe object storage for unit testing and CI."""
+
+    @property
+    def backend_name(self) -> str:
+        return "memory"
 
     def __init__(self, signing_secret: str = "memory_storage_signing_key_for_testing"):
         self._objects: Dict[str, Tuple[bytes, str, datetime]] = {}
@@ -328,6 +337,10 @@ class MemoryStorageService(StorageService):
 class LocalStorageService(StorageService):
     """Local filesystem storage with path traversal defenses."""
 
+    @property
+    def backend_name(self) -> str:
+        return "local"
+
     def __init__(self, base_path: str = "./data/storage", signing_secret: str = "local_storage_secret"):
         self.base_path = Path(base_path).resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -493,6 +506,10 @@ class LocalStorageService(StorageService):
 class S3StorageService(StorageService):
     """S3-compatible object storage provider (AWS S3, MinIO, Cloudflare R2, Google Cloud Storage S3 API)."""
 
+    @property
+    def backend_name(self) -> str:
+        return "s3"
+
     def __init__(
         self,
         endpoint_url: Optional[str] = None,
@@ -655,8 +672,15 @@ class S3StorageService(StorageService):
         fd, raw_temp_path = tempfile.mkstemp(prefix="regulens_s3_spool_", suffix=".tmp")
         try:
             os.chmod(raw_temp_path, 0o600)
-        except OSError:
-            pass
+        except OSError as chmod_err:
+            os.close(fd)
+            try:
+                Path(raw_temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise StorageSecurityError(
+                f"Failed to set secure permissions (0600) on temporary spool file: {chmod_err}"
+            ) from chmod_err
         os.close(fd)
 
         temp_path = Path(raw_temp_path)
@@ -773,6 +797,10 @@ class S3StorageService(StorageService):
 
 class GCSStorageService(StorageService):
     """Google Cloud Storage (GCS) provider implementing private bucket controls."""
+
+    @property
+    def backend_name(self) -> str:
+        return "gcs"
 
     def __init__(
         self,
@@ -894,8 +922,15 @@ class GCSStorageService(StorageService):
         fd, raw_temp_path = tempfile.mkstemp(prefix="regulens_gcs_spool_", suffix=".tmp")
         try:
             os.chmod(raw_temp_path, 0o600)
-        except OSError:
-            pass
+        except OSError as chmod_err:
+            os.close(fd)
+            try:
+                Path(raw_temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise StorageSecurityError(
+                f"Failed to set secure permissions (0600) on temporary spool file: {chmod_err}"
+            ) from chmod_err
         os.close(fd)
 
         temp_path = Path(raw_temp_path)

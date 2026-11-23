@@ -50,6 +50,7 @@ from app.db.models import (
     Consignment,
     Document,
     Product,
+    StorageCleanupTask,
     Tenant,
     TenantUser,
     User,
@@ -682,7 +683,7 @@ async def test_real_application_path_post_commit_integration(
 @pytest.mark.asyncio(loop_scope="function")
 async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSession):
     """Catalog Test: Verifies that every RLS policy using app.current_tenant_id or app.current_user_id contains NULLIF."""
-    # 1. Policies using app.current_tenant_id (13 policies across 12 tables)
+    # 1. Policies using app.current_tenant_id (14 policies across 13 tables including storage_cleanup_tasks)
     query_tenant = text("""
         SELECT tablename, policyname, cmd, qual, with_check
         FROM pg_policies
@@ -691,7 +692,7 @@ async def test_catalog_all_rls_policies_contain_nullif(admin_session: AsyncSessi
     """)
     res_tenant = await admin_session.execute(query_tenant)
     policies_tenant = res_tenant.all()
-    assert len(policies_tenant) == 13, f"Expected exactly 13 policies using app.current_tenant_id, found {len(policies_tenant)}"
+    assert len(policies_tenant) == 14, f"Expected exactly 14 policies using app.current_tenant_id, found {len(policies_tenant)}"
     for tablename, policyname, cmd, qual, with_check in policies_tenant:
         if qual and "app.current_tenant_id" in qual:
             assert "nullif" in qual.lower(), (
@@ -1990,7 +1991,7 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
     # 1. Verify initial head precondition (ensuring starting at 0003 for this test)
     res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
     initial_version = res.scalar()
-    if initial_version == "0004_document_storage_fields":
+    if initial_version in ("0004_document_storage_fields", "0005_storage_cleanup_outbox"):
         await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         initial_version = res.scalar()
@@ -2177,12 +2178,12 @@ async def test_migration_0003_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         try:
             res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
             cur_version = res_cur.scalar()
-            if cur_version != "0004_document_storage_fields":
+            if cur_version != "0005_storage_cleanup_outbox":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
                 res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-                if res_after.scalar() != "0004_document_storage_fields":
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
                     teardown_errors.append(
-                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
                     )
         except Exception as e:
             teardown_errors.append(f"Error verifying/restoring Alembic version in test_migration_0003: {e}")
@@ -2231,8 +2232,8 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
     alembic_cfg.set_main_option("script_location", str(alembic_dir))
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
-    # 1. Ensure at 0004 head
-    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+    # 1. Ensure at 0004
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
     res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
     assert res.scalar() == "0004_document_storage_fields"
 
@@ -2286,8 +2287,8 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         """))
         assert idx_down.scalar() is None
 
-        # 4. Re-upgrade to head (0004)
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        # 4. Re-upgrade to 0004
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
         res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         assert res_up.scalar() == "0004_document_storage_fields"
 
@@ -2311,12 +2312,12 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
         try:
             res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
             cur_version = res_cur.scalar()
-            if cur_version != "0004_document_storage_fields":
+            if cur_version != "0005_storage_cleanup_outbox":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
                 res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-                if res_after.scalar() != "0004_document_storage_fields":
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
                     teardown_errors.append(
-                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
                     )
 
             # Verify schema integrity (Package C columns restored on documents table)
@@ -2400,8 +2401,8 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         assert res.scalar() == "0003_membership_rls_policies"
 
-        # Re-upgrade to head (0004)
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        # Re-upgrade to 0004
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
         res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
         assert res_up.scalar() == "0004_document_storage_fields"
     finally:
@@ -2423,12 +2424,12 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
         try:
             res_check = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
             cur_version = res_check.scalar()
-            if cur_version != "0004_document_storage_fields":
+            if cur_version != "0005_storage_cleanup_outbox":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
                 res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-                if res_after.scalar() != "0004_document_storage_fields":
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
                     teardown_errors.append(
-                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
                     )
 
             # Verify schema integrity (Package C columns restored)
@@ -2495,6 +2496,8 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     try:
+        # Ensure at 0004
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
         # Attempt downgrade; must raise RuntimeError with remediation message
         with pytest.raises(Exception) as excinfo:
             await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
@@ -2526,12 +2529,12 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
         try:
             res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
             cur_version = res_cur.scalar()
-            if cur_version != "0004_document_storage_fields":
+            if cur_version != "0005_storage_cleanup_outbox":
                 await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
                 res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
-                if res_after.scalar() != "0004_document_storage_fields":
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
                     teardown_errors.append(
-                        f"Failed to restore Alembic version to 0004_document_storage_fields; current: {res_after.scalar()}"
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
                     )
 
             # Verify schema integrity (Package C columns restored)
@@ -3062,4 +3065,310 @@ async def test_cleanup_fails_safely_when_tenant_context_missing(
             tenant_id=tenant_a,
             actor_user_id=user_1_id,
             cutoff_hours=-12,
+        )
+
+
+# ============================================================================
+# Migration 0005 Downgrade & Upgrade Lifecycle Verification Gate
+# ============================================================================
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_migration_0005_downgrade_and_upgrade_cycle(admin_session: AsyncSession):
+    """Behavioral Gate: Alembic downgrade to 0004 and upgrade to 0005 cycle against PostgreSQL 16.
+
+    Verifies:
+    1. Precondition: Starts from Package C outbox migration head (0005_storage_cleanup_outbox).
+    2. Verifies storage_cleanup_tasks table, columns, indexes, and RLS exist.
+    3. Downgrades cleanly to 0004_document_storage_fields.
+    4. Verifies storage_cleanup_tasks table and indexes are dropped.
+    5. Re-upgrades to 0005_storage_cleanup_outbox / head.
+    6. Verifies storage_cleanup_tasks table, indexes, and RLS policies are restored.
+    """
+    import asyncio
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic import command
+    from app.core.config import settings
+
+    migration_url = (
+        os.getenv("DATABASE_MIGRATION_URL")
+        or os.getenv("DATABASE_ADMIN_TEST_URL")
+        or settings.DATABASE_MIGRATION_URL
+    )
+    settings.DATABASE_MIGRATION_URL = migration_url
+    os.environ["DATABASE_MIGRATION_URL"] = migration_url
+
+    ini_path = Path(__file__).resolve().parent.parent.parent / "apps" / "api" / "alembic.ini"
+    alembic_dir = ini_path.parent / "alembic"
+
+    alembic_cfg = Config(str(ini_path))
+    alembic_cfg.set_main_option("script_location", str(alembic_dir))
+    alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
+
+    # 1. Ensure at 0005 head
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    assert res.scalar() == "0005_storage_cleanup_outbox"
+
+    # 2. Verify table exists in 0005
+    tbl_res = await admin_session.execute(text("""
+        SELECT count(*) FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+    """))
+    assert tbl_res.scalar() == 1
+
+    # Verify RLS enabled and forced
+    rls_res = await admin_session.execute(text("""
+        SELECT relrowsecurity, relforcerowsecurity
+        FROM pg_class
+        WHERE relname = 'storage_cleanup_tasks';
+    """))
+    row = rls_res.fetchone()
+    assert row is not None
+    assert row[0] is True  # relrowsecurity
+    assert row[1] is True  # relforcerowsecurity
+
+    try:
+        # 3. Downgrade to 0004
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        res_down = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_down.scalar() == "0004_document_storage_fields"
+
+        # Verify table dropped
+        tbl_down = await admin_session.execute(text("""
+            SELECT count(*) FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+        """))
+        assert tbl_down.scalar() == 0
+
+        # 4. Re-upgrade to head (0005)
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        res_up = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        assert res_up.scalar() == "0005_storage_cleanup_outbox"
+
+        # Verify table and RLS restored
+        tbl_restored = await admin_session.execute(text("""
+            SELECT count(*) FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'storage_cleanup_tasks';
+        """))
+        assert tbl_restored.scalar() == 1
+
+        rls_restored = await admin_session.execute(text("""
+            SELECT relrowsecurity, relforcerowsecurity
+            FROM pg_class
+            WHERE relname = 'storage_cleanup_tasks';
+        """))
+        row_restored = rls_restored.fetchone()
+        assert row_restored[0] is True
+        assert row_restored[1] is True
+
+    finally:
+        teardown_errors = []
+        try:
+            res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+            cur_version = res_cur.scalar()
+            if cur_version != "0005_storage_cleanup_outbox":
+                await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+                res_after = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+                if res_after.scalar() != "0005_storage_cleanup_outbox":
+                    teardown_errors.append(
+                        f"Failed to restore Alembic version to 0005_storage_cleanup_outbox; current: {res_after.scalar()}"
+                    )
+        except Exception as e:
+            teardown_errors.append(f"Error during Alembic restoration in test_migration_0005: {e}")
+
+        if teardown_errors:
+            pytest.fail(
+                "Teardown failed in test_migration_0005_downgrade_and_upgrade_cycle: "
+                + "; ".join(teardown_errors)
+            )
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_storage_cleanup_tasks_cross_tenant_isolation(
+    db_session: AsyncSession,
+    provisioned_hierarchy: dict,
+):
+    """Behavioral Test: Tenant A cannot read, update, or delete Tenant B's storage_cleanup_tasks, and cross-tenant INSERT is rejected."""
+    h = provisioned_hierarchy
+    tenant_a = h["tenant_a"]
+    tenant_b = h["tenant_b"]
+
+    # 1. Tenant A inserts task under its own tenant context
+    await set_tenant_context(db_session, tenant_a)
+    task_a_id = uuid.uuid4()
+    key_a = f"tenants/{tenant_a}/quarantine/test_a.pdf"
+
+    task_a = StorageCleanupTask(
+        id=task_a_id,
+        tenant_id=tenant_a,
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+
+    # 2. Positive control: Tenant A can read own task
+    stmt_own = select(StorageCleanupTask).where(StorageCleanupTask.id == task_a_id)
+    own_task = (await db_session.execute(stmt_own)).scalar_one_or_none()
+    assert own_task is not None
+    assert own_task.id == task_a_id
+
+    # 3. Switch to Tenant B: Tenant B CANNOT read Tenant A's task
+    await set_tenant_context(db_session, tenant_b)
+    res_b = (await db_session.execute(stmt_own)).scalar_one_or_none()
+    assert res_b is None, "Tenant B leaked Tenant A's storage_cleanup_tasks record under RLS!"
+
+    # 4. Negative control: Tenant B UPDATE against Tenant A's task affects 0 rows
+    stmt_tamper = text("""
+        UPDATE storage_cleanup_tasks
+        SET status = 'COMPLETED'
+        WHERE id = :id;
+    """)
+    tamper_res = await db_session.execute(stmt_tamper, {"id": str(task_a_id)})
+    assert tamper_res.rowcount == 0, "Tenant B tampered with Tenant A's storage_cleanup_task!"
+
+    # 5. Negative control: Tenant B DELETE against Tenant A's task affects 0 rows
+    stmt_del = text("DELETE FROM storage_cleanup_tasks WHERE id = :id;")
+    del_res = await db_session.execute(stmt_del, {"id": str(task_a_id)})
+    assert del_res.rowcount == 0, "Tenant B deleted Tenant A's storage_cleanup_task!"
+
+    # 6. Negative control: Tenant B attempting to INSERT a row with tenant_id = Tenant A is rejected by WITH CHECK
+    task_cross_insert = StorageCleanupTask(
+        id=uuid.uuid4(),
+        tenant_id=tenant_a,  # Forged foreign tenant
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="DOCUMENT_DELETION",
+        status="PENDING",
+    )
+    db_session.add(task_cross_insert)
+    with pytest.raises(DBAPIError) as exc_info:
+        await db_session.commit()
+    orig = getattr(exc_info.value, "orig", exc_info.value)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    assert sqlstate == "42501" or "violates row-level security policy" in str(orig).lower()
+    await db_session.rollback()
+
+    # Clean up Tenant A's task
+    await set_tenant_context(db_session, tenant_a)
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_a_id)})
+    await db_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_postgres_rls_reconciliation_cross_tenant_isolation(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Behavioral Test: Storage reconciliation for Tenant A claims and processes only Tenant A's tasks, strictly ignoring Tenant B's tasks."""
+    from app.services.cleanup import reconcile_storage_cleanup_tasks
+    from app.services.storage import MemoryStorageService
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    tenant_b = ctx["tenant_b_id"]
+    user_1_id = ctx["user_1_id"]  # Owner/Admin in Tenant A
+
+    storage = MemoryStorageService()
+
+    # 1. Seed Tenant A's task and object
+    key_a = f"tenants/{tenant_a}/quarantine/doc_a.pdf"
+    storage.put_object(key_a, b"data_a")
+    task_a_id = uuid.uuid4()
+    await set_tenant_context(db_session, tenant_a)
+    task_a = StorageCleanupTask(
+        id=task_a_id,
+        tenant_id=tenant_a,
+        storage_backend="memory",
+        object_key=key_a,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+
+    # 2. Seed Tenant B's task and object
+    key_b = f"tenants/{tenant_b}/quarantine/doc_b.pdf"
+    storage.put_object(key_b, b"data_b")
+    task_b_id = uuid.uuid4()
+    await set_tenant_context(db_session, tenant_b)
+    task_b = StorageCleanupTask(
+        id=task_b_id,
+        tenant_id=tenant_b,
+        storage_backend="memory",
+        object_key=key_b,
+        cleanup_reason="QUARANTINE_POST_FINALIZE",
+        status="PENDING",
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+
+    # 3. Execute reconciliation for Tenant A using Actor 1 (Tenant A Owner)
+    report = await reconcile_storage_cleanup_tasks(
+        db=db_session,
+        tenant_id=tenant_a,
+        actor_user_id=user_1_id,
+        storage_service=storage,
+    )
+
+    assert report.scanned_count == 1
+    assert report.completed_count == 1
+    assert task_a_id in report.task_ids_completed
+
+    # Object A is purged
+    assert not storage.object_exists(key_a)
+
+    # Object B remains INTACT and Tenant B's task remains PENDING
+    assert storage.object_exists(key_b)
+    await set_tenant_context(db_session, tenant_b)
+    stmt_check_b = select(StorageCleanupTask).where(StorageCleanupTask.id == task_b_id)
+    task_b_db = (await db_session.execute(stmt_check_b)).scalar_one_or_none()
+    assert task_b_db is not None
+    assert task_b_db.status == "PENDING"
+
+    # Cleanup test tasks
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_b_id)})
+    await set_tenant_context(db_session, tenant_a)
+    await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_a_id)})
+    await db_session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_reconcile_fails_safely_when_inputs_or_roles_invalid(
+    db_session: AsyncSession,
+    provisioned_multi_tenant_users: dict,
+):
+    """Safety check: reconcile_storage_cleanup_tasks validates inputs and enforces OWNER/ADMIN live role."""
+    from app.services.cleanup import reconcile_storage_cleanup_tasks
+
+    ctx = provisioned_multi_tenant_users
+    tenant_a = ctx["tenant_a_id"]
+    user_1_id = ctx["user_1_id"]
+
+    # 1. Invalid limit
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=user_1_id,
+            limit=0,
+        )
+
+    # 2. Missing tenant_id
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=None,
+            actor_user_id=user_1_id,
+        )
+
+    # 3. Missing actor_user_id
+    with pytest.raises(ValueError, match="actor_user_id is required"):
+        await reconcile_storage_cleanup_tasks(
+            db=db_session,
+            tenant_id=tenant_a,
+            actor_user_id=None,
         )

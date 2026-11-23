@@ -26,6 +26,7 @@ from app.schemas.document import (
     DocumentListResponse,
 )
 from app.services.audit import log_document_audit_event
+from app.services.cleanup import create_cleanup_task, execute_cleanup_task
 from app.services.file_validation import validate_file_content
 from app.services.scanner import ScanStatus, get_malware_scanner
 from app.services.storage import (
@@ -492,6 +493,17 @@ async def finalize_upload(
     document.validated_at = datetime.now(timezone.utc)
     document.rejection_reason = None
 
+    # Step A: Enqueue durable storage cleanup outbox task within active transaction
+    cleanup_task = None
+    if quarantine_key_to_purge:
+        cleanup_task = await create_cleanup_task(
+            db=db,
+            tenant_id=current_user.tenant_id,
+            object_key=quarantine_key_to_purge,
+            cleanup_reason="QUARANTINE_POST_FINALIZE",
+            storage_backend=getattr(storage_service, "backend_name", "unknown"),
+        )
+
     await log_document_audit_event(
         db=db,
         tenant_id=current_user.tenant_id,
@@ -542,14 +554,16 @@ async def finalize_upload(
             detail="Database transaction commit failed during document finalization. Operation is retry-safe; please retry.",
         ) from commit_err
 
-    # Step B: Purge from quarantine post-commit (best-effort; retention cleaner will prune if this fails)
-    if quarantine_key_to_purge and storage_service.object_exists(quarantine_key_to_purge):
+    # Step B: Opportunistically execute cleanup task post-commit.
+    # If storage fails, task remains durably recorded in storage_cleanup_tasks for reconciliation retry.
+    if cleanup_task:
         try:
-            storage_service.delete_object(quarantine_key_to_purge)
+            await execute_cleanup_task(db=db, task=cleanup_task, storage_service=storage_service)
         except Exception as purge_err:
             logger.warning(
-                "quarantine_cleanup_post_finalize_failed",
+                "quarantine_cleanup_post_finalize_opportunistic_failed",
                 document_id=str(document.id),
+                task_id=str(cleanup_task.id),
                 quarantine_key=quarantine_key_to_purge,
                 error=str(purge_err),
             )
@@ -703,10 +717,23 @@ async def delete_document(
     storage_key_to_purge = document.storage_key
     quarantine_key_to_purge = document.quarantine_key
 
-    # 1. Delete row from documents table within transaction
+    # 1. Enqueue durable storage cleanup outbox tasks within transaction
+    cleanup_tasks = []
+    for key in (storage_key_to_purge, quarantine_key_to_purge):
+        if key:
+            task = await create_cleanup_task(
+                db=db,
+                tenant_id=current_user.tenant_id,
+                object_key=key,
+                cleanup_reason="DOCUMENT_DELETION",
+                storage_backend=getattr(storage_service, "backend_name", "unknown"),
+            )
+            cleanup_tasks.append(task)
+
+    # 2. Delete row from documents table within transaction
     await db.delete(document)
 
-    # 2. Record append-only audit event within transaction
+    # 3. Record append-only audit event within transaction
     await log_document_audit_event(
         db=db,
         tenant_id=current_user.tenant_id,
@@ -732,18 +759,19 @@ async def delete_document(
             detail="Database transaction commit failed during document deletion. Document was not deleted.",
         ) from commit_err
 
-    # 3. Purge storage objects post-commit (if storage fails, orphaned objects are logged for reconciliation)
-    for key in (storage_key_to_purge, quarantine_key_to_purge):
-        if key and storage_service.object_exists(key):
-            try:
-                storage_service.delete_object(key)
-            except Exception as e:
-                logger.error(
-                    "storage_object_purge_failed_post_delete_commit",
-                    key=key,
-                    document_id=str(document_id),
-                    error=str(e),
-                )
+    # 4. Opportunistically execute cleanup tasks post-commit.
+    # If storage fails, tasks remain durably recorded in storage_cleanup_tasks for reconciliation retry.
+    for task in cleanup_tasks:
+        try:
+            await execute_cleanup_task(db=db, task=task, storage_service=storage_service)
+        except Exception as e:
+            logger.warning(
+                "storage_object_purge_opportunistic_failed_post_delete",
+                task_id=str(task.id),
+                key=task.object_key,
+                document_id=str(document_id),
+                error=str(e),
+            )
 
     return {"status": "deleted", "document_id": str(document_id)}
 

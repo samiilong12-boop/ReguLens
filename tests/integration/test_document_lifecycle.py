@@ -42,7 +42,7 @@ from app.api.deps import (
 )
 from app.api.v1.router import api_router
 from app.core.security import create_access_token
-from app.db.models import AuditLog, Consignment, Document
+from app.db.models import AuditLog, Consignment, Document, StorageCleanupTask
 from app.services.audit import sanitize_audit_details
 from app.services.scanner import (
     EICAR_SIGNATURE,
@@ -71,6 +71,7 @@ class MockAsyncSession:
         self.sync_session = type("SyncSession", (), {"info": {}})()
         self._pending_deletions = set()
         self._initial_doc_ids = set(self.db_store.get("documents", {}).keys())
+        self._initial_cleanup_task_ids = set(self.db_store.get("cleanup_tasks", {}).keys())
         self._snapshots = {}
         for doc_id, doc in self.db_store.get("documents", {}).items():
             self._snapshots[doc_id] = {
@@ -102,6 +103,10 @@ class MockAsyncSession:
             self.db_store["consignments"][obj.id] = obj
         elif isinstance(obj, AuditLog):
             self.db_store["audit_logs"].append(obj)
+        elif isinstance(obj, StorageCleanupTask):
+            if "cleanup_tasks" not in self.db_store:
+                self.db_store["cleanup_tasks"] = {}
+            self.db_store["cleanup_tasks"][obj.id] = obj
 
     async def delete(self, obj: Any) -> None:
         if isinstance(obj, Document):
@@ -140,6 +145,12 @@ class MockAsyncSession:
                 if doc:
                     for k, v in self._snapshots[doc_id].items():
                         setattr(doc, k, v)
+        # Restore cleanup tasks
+        if "cleanup_tasks" in self.db_store:
+            current_task_ids = list(self.db_store["cleanup_tasks"].keys())
+            for tid in current_task_ids:
+                if tid not in self._initial_cleanup_task_ids:
+                    self.db_store["cleanup_tasks"].pop(tid, None)
 
     async def refresh(self, obj: Any) -> None:
         if getattr(obj, "updated_at", None) is None:
@@ -198,6 +209,10 @@ class MockAsyncSession:
                         matched.append(doc)
                 return MockResult(items=matched)
 
+        if "from storage_cleanup_tasks" in stmt_str:
+            tasks = list(self.db_store.get("cleanup_tasks", {}).values())
+            return MockResult(items=tasks)
+
         return MockResult()
 
 
@@ -251,6 +266,7 @@ def document_test_context():
     # Pre-seeded database store
     db_store = {
         "documents": {},
+        "cleanup_tasks": {},
         "consignments": {
             consignment_a_id: Consignment(
                 id=consignment_a_id,
@@ -1605,4 +1621,169 @@ async def test_scenario_24_delete_document_db_commit_failure_preserves_storage(
     # 5. Invariant: Row deleted from DB and storage object purged post-commit
     assert uuid.UUID(doc_id) not in ctx["db_store"]["documents"]
     assert storage.object_exists(storage_key) is False
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_25_finalization_enqueues_and_executes_cleanup_outbox(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 25: Finalization enqueues an outbox cleanup task for quarantine key and marks it completed."""
+    ctx = document_test_context
+    storage = ctx["storage"]
+    token_a = ctx["tokens"]["compliance_a"]
+
+    init_res = await document_test_client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "outbox_test.pdf",
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PHYTOSANITARY_CERTIFICATE",
+            "expected_size_bytes": len(VALID_PDF_BYTES),
+            "expected_sha256": hashlib.sha256(VALID_PDF_BYTES).hexdigest(),
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res.status_code == 201
+    doc_id = init_res.json()["document_id"]
+    q_key = init_res.json()["quarantine_key"]
+
+    storage.put_object(q_key, VALID_PDF_BYTES, "application/pdf")
+
+    fin_res = await document_test_client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert fin_res.status_code == 200
+    assert fin_res.json()["status"] == "AVAILABLE"
+
+    # Outbox verification: A cleanup task was created for q_key and marked COMPLETED
+    tasks = list(ctx["db_store"]["cleanup_tasks"].values())
+    matching_tasks = [t for t in tasks if t.object_key == q_key]
+    assert len(matching_tasks) == 1
+    task = matching_tasks[0]
+    assert task.cleanup_reason == "QUARANTINE_POST_FINALIZE"
+    assert task.status == "COMPLETED"
+    assert task.completed_at is not None
+    assert not storage.object_exists(q_key)
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_26_finalization_retains_outbox_task_when_storage_delete_fails(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 26: If storage delete fails post-commit during finalization, document remains AVAILABLE and cleanup task persists in outbox for reconciliation."""
+    ctx = document_test_context
+    storage = ctx["storage"]
+    token_a = ctx["tokens"]["compliance_a"]
+
+    init_res = await document_test_client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "storage_fail_test.pdf",
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PHYTOSANITARY_CERTIFICATE",
+            "expected_size_bytes": len(VALID_PDF_BYTES),
+            "expected_sha256": hashlib.sha256(VALID_PDF_BYTES).hexdigest(),
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res.status_code == 201
+    doc_id = init_res.json()["document_id"]
+    q_key = init_res.json()["quarantine_key"]
+
+    storage.put_object(q_key, VALID_PDF_BYTES, "application/pdf")
+
+    # Mock storage delete_object failure for q_key
+    real_delete = storage.delete_object
+
+    def failing_delete(key: str) -> bool:
+        if key == q_key:
+            raise RuntimeError("Transient S3 delete timeout")
+        return real_delete(key)
+
+    storage.delete_object = failing_delete
+
+    fin_res = await document_test_client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    # The client still receives 200 OK because document finalization succeeded
+    assert fin_res.status_code == 200
+    assert fin_res.json()["status"] == "AVAILABLE"
+
+    # Verify task remains in outbox as PENDING with retry attempt recorded
+    tasks = list(ctx["db_store"]["cleanup_tasks"].values())
+    matching_tasks = [t for t in tasks if t.object_key == q_key]
+    assert len(matching_tasks) == 1
+    task = matching_tasks[0]
+    assert task.cleanup_reason == "QUARANTINE_POST_FINALIZE"
+    assert task.status == "PENDING"
+    assert task.attempts == 1
+    assert "Attempt 1 failed" in task.last_error
+    assert "Transient S3 delete timeout" in task.last_error
+
+    # Restore delete and execute task (reconciliation simulation)
+    storage.delete_object = real_delete
+    from app.services.cleanup import execute_cleanup_task
+    mock_session = MockAsyncSession(ctx["db_store"])
+    reconciled = await execute_cleanup_task(db=mock_session, task=task, storage_service=storage)
+    assert reconciled is True
+    assert task.status == "COMPLETED"
+    assert not storage.object_exists(q_key)
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_scenario_27_deletion_enqueues_and_executes_cleanup_outbox_for_all_keys(
+    document_test_client: AsyncClient,
+    document_test_context: dict,
+):
+    """Scenario 27: Document deletion enqueues outbox cleanup tasks for both storage_key and quarantine_key."""
+    ctx = document_test_context
+    storage = ctx["storage"]
+    token_a = ctx["tokens"]["compliance_a"]
+
+    # 1. Initiate upload
+    init_res = await document_test_client.post(
+        "/api/v1/documents/initiate-upload",
+        json={
+            "file_name": "delete_outbox_test.pdf",
+            "claimed_mime_type": "application/pdf",
+            "document_type": "PHYTOSANITARY_CERTIFICATE",
+            "expected_size_bytes": len(VALID_PDF_BYTES),
+            "expected_sha256": hashlib.sha256(VALID_PDF_BYTES).hexdigest(),
+        },
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert init_res.status_code == 201
+    doc_id = init_res.json()["document_id"]
+    q_key = init_res.json()["quarantine_key"]
+
+    storage.put_object(q_key, VALID_PDF_BYTES, "application/pdf")
+
+    # 2. Finalize upload
+    fin_res = await document_test_client.post(
+        f"/api/v1/documents/{doc_id}/finalize-upload",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert fin_res.status_code == 200
+    doc_in_db = ctx["db_store"]["documents"][uuid.UUID(doc_id)]
+    storage_key = doc_in_db.storage_key
+    assert storage.object_exists(storage_key) is True
+
+    # 3. Delete document
+    del_res = await document_test_client.delete(
+        f"/api/v1/documents/{doc_id}",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert del_res.status_code == 200
+    assert del_res.json()["status"] == "deleted"
+
+    # 4. Outbox verification: DOCUMENT_DELETION task created and completed
+    tasks = list(ctx["db_store"]["cleanup_tasks"].values())
+    del_tasks = [t for t in tasks if t.cleanup_reason == "DOCUMENT_DELETION"]
+    assert len(del_tasks) >= 1
+    assert all(t.status == "COMPLETED" for t in del_tasks)
+    assert not storage.object_exists(storage_key)
 
