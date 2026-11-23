@@ -121,12 +121,7 @@ else:
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provides an isolated async database session using the runtime role connection (regulens_app)."""
     test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
-    session_factory = async_sessionmaker(
-        test_engine,
-        class_=AsyncSession,
-        sync_session_class=ReguLensAppSession,
-        expire_on_commit=False,
-    )
+    session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         yield session
     await test_engine.dispose()
