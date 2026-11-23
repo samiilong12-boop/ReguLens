@@ -121,7 +121,12 @@ else:
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provides an isolated async database session using the runtime role connection (regulens_app)."""
     test_engine = create_async_engine(DATABASE_TEST_URL, pool_pre_ping=True)
-    session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        sync_session_class=ReguLensAppSession,
+        expire_on_commit=False,
+    )
     async with session_factory() as session:
         yield session
     await test_engine.dispose()
@@ -2233,7 +2238,12 @@ async def test_migration_0004_downgrade_and_upgrade_cycle(admin_session: AsyncSe
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     # 1. Ensure at 0004
-    await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+    res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+    cur_version = res.scalar()
+    if cur_version == "0005_storage_cleanup_outbox":
+        await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+    elif cur_version != "0004_document_storage_fields":
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
     res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
     assert res.scalar() == "0004_document_storage_fields"
 
@@ -2396,6 +2406,14 @@ async def test_migration_0004_downgrade_with_compatible_records_succeeds(
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     try:
+        # Ensure starting at 0004
+        res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        cur_v = res_cur.scalar()
+        if cur_v == "0005_storage_cleanup_outbox":
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        elif cur_v != "0004_document_storage_fields":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+
         # Downgrade to 0003 with compatible records
         await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
         res = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
@@ -2496,8 +2514,13 @@ async def test_migration_0004_downgrade_aborts_safely_when_null_rows_present(
     alembic_cfg.set_main_option("sqlalchemy.url", migration_url)
 
     try:
-        # Ensure at 0004
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
+        # Ensure starting at 0004
+        res_cur = await admin_session.execute(text("SELECT version_num FROM alembic_version;"))
+        cur_v = res_cur.scalar()
+        if cur_v == "0005_storage_cleanup_outbox":
+            await asyncio.to_thread(command.downgrade, alembic_cfg, "0004_document_storage_fields")
+        elif cur_v != "0004_document_storage_fields":
+            await asyncio.to_thread(command.upgrade, alembic_cfg, "0004_document_storage_fields")
         # Attempt downgrade; must raise RuntimeError with remediation message
         with pytest.raises(Exception) as excinfo:
             await asyncio.to_thread(command.downgrade, alembic_cfg, "0003_membership_rls_policies")
@@ -3209,6 +3232,7 @@ async def test_postgres_rls_storage_cleanup_tasks_cross_tenant_isolation(
     )
     db_session.add(task_a)
     await db_session.commit()
+    await set_tenant_context(db_session, tenant_a)
 
     # 2. Positive control: Tenant A can read own task
     stmt_own = select(StorageCleanupTask).where(StorageCleanupTask.id == task_a_id)
@@ -3330,7 +3354,10 @@ async def test_postgres_rls_reconciliation_cross_tenant_isolation(
     assert task_b_db.status == "PENDING"
 
     # Cleanup test tasks
+    await set_tenant_context(db_session, tenant_b)
     await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_b_id)})
+    await db_session.commit()
+
     await set_tenant_context(db_session, tenant_a)
     await db_session.execute(text("DELETE FROM storage_cleanup_tasks WHERE id = :id"), {"id": str(task_a_id)})
     await db_session.commit()

@@ -282,6 +282,9 @@ async def execute_cleanup_task(
        sanitizes diagnostic message in last_error (no leaked URLs or secrets), and marks FAILED if attempts >= max_attempts.
     6. Commits task state change to database.
     """
+    # Ensure transaction context is actively armed for the task's tenant under PostgreSQL RLS
+    await set_tenant_context(db, task.tenant_id)
+
     expected_prefix = f"tenants/{task.tenant_id}/"
     if not task.object_key.startswith(expected_prefix):
         err_msg = (
@@ -466,6 +469,10 @@ async def reconcile_storage_cleanup_tasks(
         task.locked_by = effective_worker_id
         task.updated_at = datetime.now(timezone.utc)
         await db.commit()
+
+        # Re-arm tenant and user context after commit for subsequent operations
+        await set_user_context(db, actor_user_id)
+        await set_tenant_context(db, tenant_id)
 
         # Execute cleanup
         success = await execute_cleanup_task(db=db, task=task, storage_service=storage)

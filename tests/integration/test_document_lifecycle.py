@@ -156,7 +156,7 @@ class MockAsyncSession:
         if getattr(obj, "updated_at", None) is None:
             obj.updated_at = datetime.now(timezone.utc)
 
-    async def execute(self, statement: Any) -> Any:
+    async def execute(self, statement: Any, params: Any = None, *args, **kwargs) -> Any:
         # Inspect statement to determine query target
         stmt_str = str(statement).lower()
 
